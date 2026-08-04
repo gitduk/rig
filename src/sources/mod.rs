@@ -1,0 +1,795 @@
+//! Shared installer mechanics: asset selection, download, extraction,
+//! bin/completions collection with conflict checks, and setup hook
+//! execution. Per-source-type modules (`repo.rs`, ...) orchestrate these
+//! into the full install flow for their config shape.
+
+pub mod apt;
+pub mod cargo;
+pub mod curl;
+pub mod git;
+pub mod node;
+pub mod plugin;
+pub mod repo;
+
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use anyhow::{Context, bail};
+
+use crate::config::{BinSpec, BpickSpec, Common, CompletionsSpec, EvalSpec, SetupSpec};
+use crate::lock::Lock;
+use crate::paths;
+use crate::version::github::Asset;
+
+/// Re-exported: definition moved to `config.rs` (where `ResolvedEntry` also needs it).
+pub use crate::config::tool_key;
+
+const USER_AGENT: &str = concat!("rig/", env!("CARGO_PKG_VERSION"));
+
+/// Applies configured `env` to an install subprocess — never inherit-only,
+/// or install location depends on the caller's shell.
+pub fn apply_env(cmd: &mut Command, env: &HashMap<String, String>) -> anyhow::Result<()> {
+    if env.is_empty() {
+        return Ok(());
+    }
+    let home = paths::home_dir()?;
+    for (key, value) in env {
+        cmd.env(key, paths::expand_tilde_in(&home, value));
+    }
+    Ok(())
+}
+
+/// For source types where the package manager places files itself
+/// (`[[apt]]`, `[[curl]]`) — rig just records where PATH resolves it.
+pub fn resolve_on_path(name: &str) -> anyhow::Result<String> {
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(format!("command -v {name}"))
+        .output()
+        .with_context(|| format!("failed to run `command -v {name}`"))?;
+    if !output.status.success() {
+        bail!("{name} is not on PATH");
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Resolves every declared command name via PATH — `[[apt]]`/`[[curl]]`'s
+/// equivalent of `collect_bins` for source types rig doesn't symlink into.
+pub fn resolve_declared_bins(
+    bin: Option<&BinSpec>,
+    tool: &str,
+    context: &str,
+) -> anyhow::Result<Vec<String>> {
+    BinSpec::declared_names(bin, tool)
+        .iter()
+        .map(|name| {
+            resolve_on_path(name)
+                .with_context(|| format!("{name} not found on PATH after {context}"))
+        })
+        .collect()
+}
+
+/// Explicit `bpick` wins; else a naive `<arch>-<os>` filter. Ambiguous or
+/// empty matches are reported, never guessed.
+pub fn select_asset<'a>(
+    assets: &'a [Asset],
+    bpick: Option<&BpickSpec>,
+) -> anyhow::Result<&'a Asset> {
+    if let Some(spec) = bpick {
+        let patterns: Vec<&str> = match spec {
+            BpickSpec::Single(p) => vec![p.as_str()],
+            BpickSpec::Multiple(ps) => ps.iter().map(String::as_str).collect(),
+        };
+        let matches: Vec<&Asset> = assets
+            .iter()
+            .filter(|a| patterns.iter().any(|p| glob_match(p, &a.name)))
+            .collect();
+        return one_match(matches, "bpick");
+    }
+
+    let arch = host_arch();
+    let os = host_os();
+    let matches: Vec<&Asset> = assets
+        .iter()
+        .filter(|a| a.name.contains(arch) && a.name.contains(os))
+        .collect();
+    one_match(matches, &format!("{arch}-{os}"))
+}
+
+fn one_match<'a>(matches: Vec<&'a Asset>, criterion: &str) -> anyhow::Result<&'a Asset> {
+    match matches.len() {
+        0 => bail!("no release asset matches {criterion}; set `bpick` explicitly"),
+        1 => Ok(matches[0]),
+        _ => {
+            let names: Vec<&str> = matches.iter().map(|a| a.name.as_str()).collect();
+            bail!("{criterion} matches multiple assets, set `bpick` to disambiguate: {names:?}")
+        }
+    }
+}
+
+fn host_arch() -> &'static str {
+    if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else {
+        "unknown"
+    }
+}
+
+fn host_os() -> &'static str {
+    if cfg!(target_os = "linux") {
+        "linux"
+    } else if cfg!(target_os = "macos") {
+        "darwin"
+    } else {
+        "unknown"
+    }
+}
+
+/// `*`-only glob — the doc never uses `?` or character classes.
+pub fn glob_match(pattern: &str, name: &str) -> bool {
+    let parts: Vec<&str> = pattern.split('*').collect();
+    if parts.len() == 1 {
+        return pattern == name;
+    }
+
+    let last = parts.len() - 1;
+    let mut rest = name;
+    for (i, part) in parts.iter().enumerate() {
+        if part.is_empty() {
+            continue;
+        }
+        if i == 0 {
+            match rest.strip_prefix(part) {
+                Some(r) => rest = r,
+                None => return false,
+            }
+        } else if i == last {
+            return rest.ends_with(part);
+        } else {
+            match rest.find(part) {
+                Some(pos) => rest = &rest[pos + part.len()..],
+                None => return false,
+            }
+        }
+    }
+    true
+}
+
+pub fn download(url: &str, dest: &Path, expected_size: u64) -> anyhow::Result<()> {
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    let mut response = ureq::get(url)
+        .header("User-Agent", USER_AGENT)
+        .call()
+        .with_context(|| format!("failed to download {url}"))?;
+
+    let mut file =
+        fs::File::create(dest).with_context(|| format!("failed to create {}", dest.display()))?;
+    let written = std::io::copy(&mut response.body_mut().as_reader(), &mut file)
+        .with_context(|| format!("failed to write {}", dest.display()))?;
+
+    if written != expected_size {
+        bail!(
+            "downloaded {written} bytes from {url}, expected {expected_size} \
+             (truncated download or asset changed upstream)"
+        );
+    }
+    Ok(())
+}
+
+/// Symlinks repoint only after success — clear any stale `final_dir`,
+/// then atomically rename `.partial` into place.
+pub fn finalize_partial(partial_dir: &Path, final_dir: &Path) -> anyhow::Result<()> {
+    if final_dir.exists() {
+        fs::remove_dir_all(final_dir)
+            .with_context(|| format!("failed to remove stale {}", final_dir.display()))?;
+    }
+    fs::rename(partial_dir, final_dir).with_context(|| {
+        format!(
+            "failed to move {} into place at {}",
+            partial_dir.display(),
+            final_dir.display()
+        )
+    })
+}
+
+/// Dispatches by extension; `extract_flag = Some(false)` means a raw
+/// binary, copied as-is rather than unpacked. No checksum verification.
+pub fn extract(archive: &Path, dest: &Path, extract_flag: Option<bool>) -> anyhow::Result<()> {
+    fs::create_dir_all(dest).with_context(|| format!("failed to create {}", dest.display()))?;
+
+    if extract_flag == Some(false) {
+        return copy_raw_binary(archive, dest);
+    }
+
+    let name = archive
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+
+    if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
+        extract_tar_gz(archive, dest)
+    } else if name.ends_with(".zip") {
+        extract_zip(archive, dest)
+    } else {
+        bail!("don't know how to extract {name}; set `extract = false` if this is a raw binary")
+    }
+}
+
+fn extract_tar_gz(archive: &Path, dest: &Path) -> anyhow::Result<()> {
+    let file =
+        fs::File::open(archive).with_context(|| format!("failed to open {}", archive.display()))?;
+    tar::Archive::new(flate2::read::GzDecoder::new(file))
+        .unpack(dest)
+        .with_context(|| format!("failed to unpack {}", archive.display()))
+}
+
+fn extract_zip(archive: &Path, dest: &Path) -> anyhow::Result<()> {
+    let file =
+        fs::File::open(archive).with_context(|| format!("failed to open {}", archive.display()))?;
+    zip::ZipArchive::new(file)
+        .with_context(|| format!("failed to read {} as a zip archive", archive.display()))?
+        .extract(dest)
+        .with_context(|| format!("failed to unpack {}", archive.display()))
+}
+
+fn copy_raw_binary(archive: &Path, dest: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let name = archive
+        .file_name()
+        .context("archive path has no file name")?;
+    let dest_path = dest.join(name);
+    fs::copy(archive, &dest_path).with_context(|| {
+        format!(
+            "failed to copy {} into {}",
+            archive.display(),
+            dest_path.display()
+        )
+    })?;
+
+    // Raw (unextracted) assets are downloaded as plain data, not marked
+    // executable — the archive itself never carries a +x bit.
+    let mut perms = fs::metadata(&dest_path)
+        .with_context(|| format!("failed to stat {}", dest_path.display()))?
+        .permissions();
+    perms.set_mode(perms.mode() | 0o111);
+    fs::set_permissions(&dest_path, perms)
+        .with_context(|| format!("failed to chmod +x {}", dest_path.display()))
+}
+
+fn walk_files(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in
+            fs::read_dir(&dir).with_context(|| format!("failed to read {}", dir.display()))?
+        {
+            let entry =
+                entry.with_context(|| format!("failed to read entry in {}", dir.display()))?;
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                out.push(path);
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn find_by_name(files: &[PathBuf], name: &str) -> anyhow::Result<PathBuf> {
+    let matches: Vec<&PathBuf> = files
+        .iter()
+        .filter(|p| p.file_name().and_then(|n| n.to_str()) == Some(name))
+        .collect();
+    match matches.len() {
+        0 => bail!("no file named {name} found in the unpacked archive"),
+        1 => Ok(matches[0].clone()),
+        _ => bail!("multiple files named {name} found in the unpacked archive: {matches:?}"),
+    }
+}
+
+/// Matches `pattern` against the path relative to `root`, not the basename —
+/// a mapped `bin` key like `"target/release/wallust"` has directory components.
+fn find_by_glob(root: &Path, files: &[PathBuf], pattern: &str) -> anyhow::Result<PathBuf> {
+    let matches: Vec<&PathBuf> = files
+        .iter()
+        .filter(|p| {
+            p.strip_prefix(root)
+                .ok()
+                .is_some_and(|rel| glob_match(pattern, &rel.to_string_lossy()))
+        })
+        .collect();
+    match matches.len() {
+        0 => bail!("no file matches `{pattern}` in the unpacked archive"),
+        1 => Ok(matches[0].clone()),
+        _ => bail!("`{pattern}` matches multiple files in the unpacked archive: {matches:?}"),
+    }
+}
+
+/// Rewrites a path under `from` to where it will live under `to` — lets
+/// collection target the post-rename location (see `collect_bins`).
+fn rebase(path: &Path, from: &Path, to: &Path) -> PathBuf {
+    match path.strip_prefix(from) {
+        Ok(rel) => to.join(rel),
+        Err(_) => path.to_path_buf(),
+    }
+}
+
+/// Resolves `bin` in `search_dir` (pre-rename `.partial`, so failure here
+/// leaves the old version untouched) but links point at `link_root`.
+pub fn collect_bins(
+    search_dir: &Path,
+    link_root: &Path,
+    bin_spec: Option<&BinSpec>,
+    default_name: &str,
+    prefix_bin_dir: &Path,
+    lock: &Lock,
+) -> anyhow::Result<Vec<(PathBuf, PathBuf)>> {
+    let files = walk_files(search_dir)?;
+
+    let resolved: Vec<(String, PathBuf)> = match bin_spec {
+        None => vec![(
+            default_name.to_string(),
+            find_by_name(&files, default_name)?,
+        )],
+        Some(BinSpec::Single(name)) => vec![(name.clone(), find_by_name(&files, name)?)],
+        Some(BinSpec::Multiple(names)) => names
+            .iter()
+            .map(|name| find_by_name(&files, name).map(|p| (name.clone(), p)))
+            .collect::<anyhow::Result<_>>()?,
+        Some(BinSpec::Mapped(map)) => map
+            .iter()
+            .map(|(pattern, cmd)| {
+                find_by_glob(search_dir, &files, pattern).map(|p| (cmd.clone(), p))
+            })
+            .collect::<anyhow::Result<_>>()?,
+    };
+
+    fs::create_dir_all(prefix_bin_dir)
+        .with_context(|| format!("failed to create {}", prefix_bin_dir.display()))?;
+
+    let mut installed = Vec::new();
+    for (cmd, source) in resolved {
+        let link_source = rebase(&source, search_dir, link_root);
+        let target = prefix_bin_dir.join(&cmd);
+        check_conflict(&target, lock)?;
+        symlink_replacing(&link_source, &target)?;
+        installed.push((link_source, target));
+    }
+    Ok(installed)
+}
+
+/// A target that exists but isn't in `rig.lock` belongs to something
+/// else — refuse rather than clobber it.
+fn check_conflict(target: &Path, lock: &Lock) -> anyhow::Result<()> {
+    if !target.exists() {
+        return Ok(());
+    }
+    let target_str = target.to_string_lossy();
+    let tracked = lock
+        .tool
+        .values()
+        .any(|t| t.bins.iter().any(|b| b == target_str.as_ref()));
+    if tracked {
+        return Ok(());
+    }
+    bail!(
+        "{} already exists and isn't tracked by rig.lock — refusing to overwrite",
+        target.display()
+    )
+}
+
+fn symlink_replacing(source: &Path, target: &Path) -> anyhow::Result<()> {
+    if target.is_symlink() {
+        fs::remove_file(target)
+            .with_context(|| format!("failed to remove stale symlink {}", target.display()))?;
+    }
+    std::os::unix::fs::symlink(source, target).with_context(|| {
+        format!(
+            "failed to symlink {} -> {}",
+            target.display(),
+            source.display()
+        )
+    })
+}
+
+/// Resolves `completions` in `search_dir`, symlinking into
+/// `completions_dir` against `link_root` — same rationale as `collect_bins`.
+pub fn collect_completions(
+    search_dir: &Path,
+    link_root: &Path,
+    spec: &CompletionsSpec,
+    completions_dir: &Path,
+    env: &HashMap<String, String>,
+) -> anyhow::Result<Vec<PathBuf>> {
+    match spec {
+        CompletionsSpec::Enabled(false) => Ok(Vec::new()),
+        CompletionsSpec::Enabled(true) => {
+            let files = walk_files(search_dir)?;
+            let sources: Vec<PathBuf> = underscore_files(&files)
+                .into_iter()
+                .map(|p| rebase(&p, search_dir, link_root))
+                .collect();
+            link_completions(&sources, completions_dir)
+        }
+        CompletionsSpec::Path { path } => {
+            let source = link_root.join(path);
+            link_completions(std::slice::from_ref(&source), completions_dir)
+        }
+        CompletionsSpec::Generate { generate } => {
+            run_shell(generate, search_dir, env)?;
+            let files = walk_files(search_dir)?;
+            let sources: Vec<PathBuf> = underscore_files(&files)
+                .into_iter()
+                .map(|p| rebase(&p, search_dir, link_root))
+                .collect();
+            link_completions(&sources, completions_dir)
+        }
+    }
+}
+
+fn underscore_files(files: &[PathBuf]) -> Vec<PathBuf> {
+    files
+        .iter()
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with('_'))
+        })
+        .cloned()
+        .collect()
+}
+
+fn link_completions(sources: &[PathBuf], completions_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    fs::create_dir_all(completions_dir)
+        .with_context(|| format!("failed to create {}", completions_dir.display()))?;
+
+    sources
+        .iter()
+        .map(|source| {
+            let name = source
+                .file_name()
+                .with_context(|| format!("{} has no file name", source.display()))?;
+            let target = completions_dir.join(name);
+            symlink_replacing(source, &target)?;
+            Ok(target)
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum Phase {
+    Install,
+    Update,
+}
+
+/// `setup`: one field covering both install and update — see the `Split`
+/// variant for the rare case that genuinely needs to differ.
+pub fn run_setup(
+    spec: &SetupSpec,
+    cwd: &Path,
+    phase: Phase,
+    env: &HashMap<String, String>,
+) -> anyhow::Result<()> {
+    match spec {
+        SetupSpec::Single(cmd) => run_shell(cmd, cwd, env),
+        SetupSpec::Multiple(cmds) => {
+            for cmd in cmds {
+                run_shell(cmd, cwd, env)?;
+            }
+            Ok(())
+        }
+        SetupSpec::Split { install, update } => {
+            let cmd = match phase {
+                Phase::Install => install,
+                Phase::Update => update,
+            };
+            run_shell(cmd, cwd, env)
+        }
+    }
+}
+
+/// Hooks that reach outside rig's control (via `sudo`) are allowed, but
+/// must not be silent about it.
+fn run_shell(cmd: &str, cwd: &Path, env: &HashMap<String, String>) -> anyhow::Result<()> {
+    if cmd.split_whitespace().any(|w| w == "sudo") {
+        eprintln!(
+            "warning: setup hook runs `sudo` — writes outside rig's control, \
+             uninstall will be incomplete: {cmd}"
+        );
+    }
+
+    let mut command = Command::new("sh");
+    command.arg("-c").arg(cmd).current_dir(cwd);
+    apply_env(&mut command, env)?;
+    let status = command
+        .status()
+        .with_context(|| format!("failed to run setup command: {cmd}"))?;
+
+    if !status.success() {
+        bail!("setup command failed ({status}): {cmd}");
+    }
+    Ok(())
+}
+
+/// Resolves `eval` to (cacheable?, output to embed, probe evidence).
+/// Probe/capture failures degrade to "not cacheable" — never fail the install.
+pub fn resolve_eval_cache(eval: Option<&EvalSpec>) -> (Option<bool>, Option<String>, Vec<String>) {
+    let Some(eval) = eval else {
+        return (None, None, Vec::new());
+    };
+
+    match eval.cache_override() {
+        Some(false) => return (Some(false), None, Vec::new()),
+        Some(true) => {
+            let output = crate::evalcache::capture(eval.command())
+                .inspect_err(|e| {
+                    eprintln!("warning: eval capture failed for `{}`: {e}", eval.command())
+                })
+                .ok();
+            return (Some(true), output, Vec::new());
+        }
+        None => {}
+    }
+
+    match crate::evalcache::probe(eval.command()) {
+        Ok(probe) => {
+            let output = probe.cacheable.then_some(probe.baseline_output);
+            (Some(probe.cacheable), output, probe.reasons)
+        }
+        Err(e) => {
+            eprintln!(
+                "warning: eval cacheability probe failed for `{}`, falling back to live eval: {e}",
+                eval.command()
+            );
+            (None, None, Vec::new())
+        }
+    }
+}
+
+/// The `bin`/`completions`/`eval` tail shared by `repo.rs`, `git.rs`, and
+/// `cargo.rs` once each has staged files into `final_dir`.
+pub struct CollectedArtifacts {
+    pub bins: Vec<(PathBuf, PathBuf)>,
+    pub completions: Vec<PathBuf>,
+}
+
+/// Deliberately excludes eval-cache resolution: it must run after
+/// `finalize_partial`, once a bin's symlink target actually exists.
+pub fn collect_artifacts(
+    search_dir: &Path,
+    link_root: &Path,
+    common: &Common,
+    tool: &str,
+    prefix_bin_dir: &Path,
+    completions_dir: &Path,
+    lock: &Lock,
+) -> anyhow::Result<CollectedArtifacts> {
+    let bins = collect_bins(
+        search_dir,
+        link_root,
+        common.bin.as_ref(),
+        tool,
+        prefix_bin_dir,
+        lock,
+    )
+    .with_context(|| format!("failed to collect binaries for {tool}"))?;
+    let completions = collect_completions(
+        search_dir,
+        link_root,
+        &common.completions,
+        completions_dir,
+        &common.env,
+    )
+    .with_context(|| format!("failed to collect completions for {tool}"))?;
+
+    Ok(CollectedArtifacts { bins, completions })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_env_sets_and_expands_tilde_values() {
+        let mut map = HashMap::new();
+        map.insert("RIG_TEST_PLAIN".to_string(), "hello".to_string());
+        map.insert("RIG_TEST_TILDE".to_string(), "~/.local".to_string());
+
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("echo $RIG_TEST_PLAIN:$RIG_TEST_TILDE");
+        apply_env(&mut cmd, &map).expect("apply_env should succeed");
+
+        let output = cmd.output().expect("sh should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let home = paths::home_dir().expect("$HOME must be set to run this test");
+        assert_eq!(stdout.trim(), format!("hello:{}/.local", home.display()));
+    }
+
+    #[test]
+    fn extract_false_marks_the_copied_binary_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let archive = tmp.path().join("witr-linux-amd64");
+        fs::write(&archive, b"not a real binary").expect("write fake asset");
+        // Downloads land with the ordinary, non-executable default mode.
+        fs::set_permissions(&archive, fs::Permissions::from_mode(0o644)).expect("chmod source");
+
+        let dest = tmp.path().join("dest");
+        extract(&archive, &dest, Some(false)).expect("copy_raw_binary should succeed");
+
+        let copied = dest.join("witr-linux-amd64");
+        let mode = fs::metadata(&copied)
+            .expect("stat copied file")
+            .permissions()
+            .mode();
+        assert_ne!(mode & 0o111, 0, "copied raw binary must be executable");
+    }
+
+    #[test]
+    fn glob_matches_prefix_suffix_and_middle() {
+        assert!(glob_match("delta", "delta"));
+        assert!(!glob_match("delta", "delta2"));
+        assert!(glob_match("nvim-*.appimage", "nvim-0.10.0.appimage"));
+        assert!(!glob_match("nvim-*.appimage", "nvim-0.10.0.tar.gz"));
+        assert!(glob_match("*-musl", "pueue-x86_64-musl"));
+        assert!(glob_match("*.tar.gz", "delta-0.18.2.tar.gz"));
+    }
+
+    fn asset(name: &str) -> Asset {
+        Asset {
+            name: name.to_string(),
+            url: format!("https://example.invalid/{name}"),
+            size: 0,
+        }
+    }
+
+    #[test]
+    fn select_asset_prefers_explicit_bpick() {
+        let assets = vec![
+            asset("delta-x86_64-unknown-linux-gnu.tar.gz"),
+            asset("delta-x86_64-unknown-linux-musl.tar.gz"),
+        ];
+        let bpick = BpickSpec::Single("*-musl.tar.gz".to_string());
+        let picked = select_asset(&assets, Some(&bpick)).expect("bpick should match one asset");
+        assert!(picked.name.contains("musl"));
+    }
+
+    #[test]
+    fn select_asset_errors_on_ambiguous_host_match() {
+        let assets = vec![
+            asset("delta-x86_64-unknown-linux-gnu.tar.gz"),
+            asset("delta-x86_64-unknown-linux-musl.tar.gz"),
+        ];
+        let err = select_asset(&assets, None).expect_err("gnu and musl both match x86_64-linux");
+        assert!(err.to_string().contains("multiple assets"));
+    }
+
+    #[test]
+    fn select_asset_errors_when_nothing_matches() {
+        let assets = vec![asset("delta-aarch64-apple-darwin.tar.gz")];
+        let err = select_asset(&assets, None).expect_err("darwin build shouldn't match linux host");
+        assert!(err.to_string().contains("no release asset matches"));
+    }
+
+    #[test]
+    fn collect_bins_resolves_a_nested_mapped_path() {
+        // wallust-style layout: only `target/release/wallust` exists, no
+        // top-level `wallust` — a basename-only match can never succeed here.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let unpacked = tmp.path().join("unpacked");
+        let build_dir = unpacked.join("target/release");
+        fs::create_dir_all(&build_dir).expect("mkdir build dir");
+        fs::write(build_dir.join("wallust"), b"binary").expect("write fake binary");
+        // A same-named decoy elsewhere must not satisfy the path-qualified pattern.
+        fs::write(unpacked.join("wallust"), b"decoy").expect("write decoy");
+
+        let mut map = std::collections::HashMap::new();
+        map.insert("target/release/wallust".to_string(), "wallust".to_string());
+        let bin_spec = BinSpec::Mapped(map);
+
+        let bin_dir = tmp.path().join("bin");
+        let lock = Lock::default();
+        let installed = collect_bins(
+            &unpacked,
+            &unpacked,
+            Some(&bin_spec),
+            "wallust",
+            &bin_dir,
+            &lock,
+        )
+        .expect("nested path should resolve");
+
+        assert_eq!(installed.len(), 1);
+        assert_eq!(installed[0].0, build_dir.join("wallust"));
+    }
+
+    #[test]
+    fn a_failed_collect_never_destroys_the_old_version() {
+        // finalize_partial must never run before collect_artifacts succeeds
+        // — otherwise a collect failure leaves neither version intact.
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        let final_dir = tmp.path().join("pkg/delta/0.18.2");
+        fs::create_dir_all(&final_dir).expect("mkdir final_dir");
+        fs::write(final_dir.join("delta"), b"old binary").expect("write old binary");
+
+        let prefix_bin_dir = tmp.path().join("bin");
+        fs::create_dir_all(&prefix_bin_dir).expect("mkdir prefix_bin_dir");
+        let bin_link = prefix_bin_dir.join("delta");
+        std::os::unix::fs::symlink(final_dir.join("delta"), &bin_link).expect("symlink old binary");
+
+        let mut lock = Lock::default();
+        lock.tool.insert(
+            "delta".to_string(),
+            test_tool_lock(vec![bin_link.display().to_string()]),
+        );
+
+        // New version's `.partial` is missing the expected binary entirely.
+        let partial_dir = tmp.path().join("pkg/delta/0.19.0.partial");
+        fs::create_dir_all(&partial_dir).expect("mkdir partial_dir");
+        let new_final_dir = tmp.path().join("pkg/delta/0.19.0");
+
+        let common = Common {
+            description: None,
+            bin: None,
+            env: HashMap::new(),
+            eval: None,
+            completions: CompletionsSpec::Enabled(false),
+            setup: None,
+        };
+        let result = collect_artifacts(
+            &partial_dir,
+            &new_final_dir,
+            &common,
+            "delta",
+            &prefix_bin_dir,
+            &tmp.path().join("completions"),
+            &lock,
+        )
+        .and_then(|_| finalize_partial(&partial_dir, &new_final_dir));
+
+        assert!(
+            result.is_err(),
+            "collect should fail: no `delta` in partial_dir"
+        );
+        assert!(final_dir.exists(), "old version dir must survive");
+        assert_eq!(
+            fs::read(final_dir.join("delta")).expect("old binary should be readable"),
+            b"old binary"
+        );
+        assert!(bin_link.is_symlink(), "old symlink must be untouched");
+        assert!(
+            !new_final_dir.exists(),
+            "finalize_partial must never have run"
+        );
+    }
+
+    fn test_tool_lock(bins: Vec<String>) -> crate::lock::ToolLock {
+        crate::lock::ToolLock {
+            version: "0.18.2".to_string(),
+            source: "github:dandavison/delta".to_string(),
+            installed_at: time::OffsetDateTime::UNIX_EPOCH,
+            bins,
+            completions: Vec::new(),
+            asset: None,
+            size: None,
+            pkg: None,
+            manager: None,
+            root: None,
+            eval_cacheable: None,
+            eval_cached_output: None,
+            eval_evidence: Vec::new(),
+        }
+    }
+}
