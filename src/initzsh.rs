@@ -4,8 +4,8 @@
 
 use std::collections::HashSet;
 
-use crate::config::{self, BinSpec, Common, Config, tool_key};
-use crate::lock::Lock;
+use crate::config::{self, BinSpec, Common, Config, EvalSpec, tool_key};
+use crate::lock::{Lock, ToolLock};
 use crate::paths::Layout;
 
 /// Reads a previously generated `init.zsh`'s `RIG_CMD` block back out —
@@ -26,12 +26,14 @@ pub fn render(config: &Config, lock: &Lock, layout: &Layout) -> String {
         .into_iter()
         .map(|e| (e.key(), e.common()))
         .collect();
+    let eager: Vec<(String, &Common)> = entries.iter().filter(|(_, c)| !c.lazy).cloned().collect();
 
     let mut out = String::new();
     render_fpath(&mut out, layout);
-    render_env(&mut out, &entries);
+    render_env(&mut out, &eager);
     render_rig_cmd_and_handler(&mut out, config, layout);
-    render_eval_blocks(&mut out, &entries, lock);
+    render_eval_blocks(&mut out, &eager, lock);
+    render_lazy_blocks(&mut out, config, lock);
     render_plugins(&mut out, config, layout);
     out
 }
@@ -115,23 +117,89 @@ fn render_eval_blocks(out: &mut String, entries: &[(String, &Common)], lock: &Lo
         let Some(tool_lock) = lock.tool.get(key) else {
             continue;
         };
-        let cmd = eval.command();
+        out.push_str(&render_eval_text(eval, tool_lock));
+        out.push('\n');
+    }
+}
 
-        match tool_lock.eval_cacheable {
-            Some(true) => {
-                if let Some(cached) = &tool_lock.eval_cached_output {
-                    out.push_str(&format!(
-                        "# cached: {cmd} (evidence: none — probed clean)\n{cached}\n\n"
-                    ));
-                } else {
-                    out.push_str(&format!("eval \"$({cmd})\"\n\n"));
-                }
-            }
-            Some(false) | None => {
-                out.push_str(&format!("eval \"$({cmd})\"\n\n"));
+/// Cached -> inline the captured output; else a plain `eval` call. Shared
+/// so the eager and lazy render paths can't disagree on this decision.
+fn render_eval_text(eval: &EvalSpec, tool_lock: &ToolLock) -> String {
+    let cmd = eval.command();
+    if tool_lock.eval_cacheable == Some(true)
+        && let Some(cached) = &tool_lock.eval_cached_output
+    {
+        format!("# cached: {cmd} (evidence: none — probed clean)\n{cached}\n")
+    } else {
+        format!("eval \"$({cmd})\"\n")
+    }
+}
+
+/// `lazy = true`: env + eval move into a shared init, run once from
+/// whichever trigger fires first (command name, or `bind`'s ZLE widget).
+fn render_lazy_blocks(out: &mut String, config: &Config, lock: &Lock) {
+    for entry in config::all_entries(config) {
+        let common = entry.common();
+        if !common.lazy || (common.env.is_empty() && common.eval.is_none()) {
+            continue;
+        }
+        let key = entry.key();
+        let Some(tool_lock) = lock.tool.get(&key) else {
+            continue;
+        };
+        let names = BinSpec::declared_names(common.bin.as_ref(), tool_key(entry.name()));
+        let bound = common.bind.as_deref().and_then(|spec| spec.split_once(':'));
+        if names.is_empty() && bound.is_none() {
+            continue;
+        }
+
+        let ident = zsh_ident(&key);
+        let init_fn = format!("_rig_lazy_init_{ident}");
+
+        let mut body = String::new();
+        if !names.is_empty() {
+            body.push_str(&format!("  unfunction {} 2>/dev/null\n", names.join(" ")));
+        }
+        for (env_key, value) in &common.env {
+            body.push_str(&format!(
+                "  export {env_key}=\"{}\"\n",
+                expand_tilde_export(value)
+            ));
+        }
+        if let Some(eval) = &common.eval {
+            for line in render_eval_text(eval, tool_lock).lines() {
+                body.push_str(&format!("  {line}\n"));
             }
         }
+        out.push_str(&format!("{init_fn}() {{\n{body}}}\n\n"));
+
+        // Rebinding on every trigger path (not just the widget one) lets a
+        // typed command name fix up `bind`'s key too, whichever fires first.
+        let rebind = bound
+            .map(|(key_seq, widget)| format!("  bindkey '{key_seq}' {widget}\n"))
+            .unwrap_or_default();
+        for name in &names {
+            out.push_str(&format!(
+                "{name}() {{\n  {init_fn}\n{rebind}  {name} \"$@\"\n}}\n\n"
+            ));
+        }
+
+        if let Some((key_seq, widget)) = bound {
+            let widget_fn = format!("_rig_lazy_bind_{ident}");
+            out.push_str(&format!(
+                "{widget_fn}() {{\n  {init_fn}\n  bindkey '{key_seq}' {widget}\n  zle {widget}\n}}\n\
+                 zle -N {widget_fn}\n\
+                 bindkey '{key_seq}' {widget_fn}\n\n"
+            ));
+        }
     }
+}
+
+/// A tool key can contain `@`, `/`, `-` — none valid in a zsh identifier.
+fn zsh_ident(key: &str) -> String {
+    key.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect()
 }
 
 /// Plugins are sourced in config order — no defer mechanism exists yet
@@ -177,8 +245,108 @@ mod tests {
                 eval,
                 completions: CompletionsSpec::Enabled(true),
                 setup: None,
+                lazy: false,
+                bind: None,
             },
         }
+    }
+
+    fn lazy_repo_entry(
+        name: &str,
+        env: HashMap<String, String>,
+        eval: Option<EvalSpec>,
+        bind: Option<&str>,
+    ) -> RepoEntry {
+        RepoEntry {
+            name: name.to_string(),
+            host: Host::Github,
+            bpick: None,
+            extract: None,
+            common: Common {
+                description: None,
+                bin: None,
+                env,
+                eval,
+                completions: CompletionsSpec::Enabled(true),
+                setup: None,
+                lazy: true,
+                bind: bind.map(str::to_string),
+            },
+        }
+    }
+
+    #[test]
+    fn lazy_tool_defers_env_and_eval_into_a_stub_function() {
+        let mut env = HashMap::new();
+        env.insert("ATUIN_TMUX_POPUP".to_string(), "false".to_string());
+        let mut config = Config::default();
+        config.repo.push(lazy_repo_entry(
+            "atuinsh/atuin",
+            env,
+            Some(EvalSpec::Cmd("atuin init zsh".to_string())),
+            None,
+        ));
+
+        let mut lock = Lock::default();
+        lock.tool
+            .insert("atuin".to_string(), tool_lock_with_eval(None, None));
+
+        let out = render(&config, &lock, &layout());
+        let lines: Vec<&str> = out.lines().collect();
+
+        assert!(!lines.contains(&"export ATUIN_TMUX_POPUP=\"false\""));
+        assert!(!lines.contains(&"eval \"$(atuin init zsh)\""));
+        assert!(lines.contains(&"_rig_lazy_init_atuin() {"));
+        assert!(lines.contains(&"  unfunction atuin 2>/dev/null"));
+        assert!(lines.contains(&"  export ATUIN_TMUX_POPUP=\"false\""));
+        assert!(lines.contains(&"  eval \"$(atuin init zsh)\""));
+        assert!(lines.contains(&"atuin() {"));
+        assert!(lines.contains(&"  _rig_lazy_init_atuin"));
+        assert!(lines.contains(&"  atuin \"$@\""));
+    }
+
+    #[test]
+    fn lazy_tool_not_yet_installed_is_skipped() {
+        let mut config = Config::default();
+        config.repo.push(lazy_repo_entry(
+            "atuinsh/atuin",
+            HashMap::new(),
+            Some(EvalSpec::Cmd("atuin init zsh".to_string())),
+            None,
+        ));
+
+        let out = render(&config, &Lock::default(), &layout());
+
+        assert!(!out.contains("atuin() {"));
+    }
+
+    #[test]
+    fn lazy_bind_wires_a_placeholder_widget_that_rebinds_on_first_use() {
+        let mut config = Config::default();
+        config.repo.push(lazy_repo_entry(
+            "denisidoro/navi",
+            HashMap::new(),
+            Some(EvalSpec::Cmd("navi widget zsh".to_string())),
+            Some("^g:_navi_widget"),
+        ));
+
+        let mut lock = Lock::default();
+        lock.tool
+            .insert("navi".to_string(), tool_lock_with_eval(None, None));
+
+        let out = render(&config, &lock, &layout());
+        let lines: Vec<&str> = out.lines().collect();
+
+        assert!(lines.contains(&"_rig_lazy_bind_navi() {"));
+        assert!(lines.contains(&"  _rig_lazy_init_navi"));
+        assert!(lines.contains(&"  bindkey '^g' _navi_widget"));
+        assert!(lines.contains(&"  zle _navi_widget"));
+        assert!(lines.contains(&"zle -N _rig_lazy_bind_navi"));
+        assert!(lines.contains(&"bindkey '^g' _rig_lazy_bind_navi"));
+        // The command-name path rebinds too, so whichever trigger fires
+        // first leaves the key pointed at the real widget, not the stub.
+        assert!(lines.contains(&"navi() {"));
+        assert!(lines.contains(&"  _rig_lazy_init_navi"));
     }
 
     #[test]
@@ -303,11 +471,29 @@ mod tests {
             defer: 1,
             atload: Some("ZSH_AUTOSUGGEST_STRATEGY=(match_prev_cmd history)".to_string()),
         });
+        let mut env = HashMap::new();
+        env.insert("ATUIN_TMUX_POPUP".to_string(), "false".to_string());
+        config.repo.push(lazy_repo_entry(
+            "atuinsh/atuin",
+            env,
+            Some(EvalSpec::Cmd("atuin init zsh".to_string())),
+            Some("^r:_atuin_search_widget"),
+        ));
 
         let mut lock = Lock::default();
         lock.tool.insert(
             "delta".to_string(),
             tool_lock_with_eval(Some(true), Some("alias cat=bat".to_string())),
+        );
+        lock.tool.insert(
+            "atuin".to_string(),
+            tool_lock_with_eval(
+                Some(true),
+                Some(
+                    "function __atuin_hook() {\n  local x=\"quoted `cmd` \\$val\"\n}\nprecmd_functions+=(__atuin_hook)"
+                        .to_string(),
+                ),
+            ),
         );
 
         let out = render(&config, &lock, &layout());

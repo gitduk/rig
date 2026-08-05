@@ -73,9 +73,16 @@ pub fn install_with_manager(
     manager: ResolvedManager,
     phase: super::Phase,
 ) -> anyhow::Result<ToolLock> {
+    println!("installing {} via {}", entry.name, manager.binary_name());
     let info = npm::latest(&entry.name)?;
     let bin_names = declared_bin_names(entry, &info);
 
+    println!(
+        "  {} install -g {}@{}",
+        manager.binary_name(),
+        entry.name,
+        info.version
+    );
     let (root, bin_dir) = match manager {
         ResolvedManager::Bun => install_via_bun(entry, layout, &info.version, &bin_names, lock)?,
         ResolvedManager::Npm => install_via_npm(entry, &info.version, &bin_names, lock)?,
@@ -106,6 +113,7 @@ pub fn install_with_manager(
         bins.push(path.display().to_string());
     }
     let completions = super::collect_completions(
+        &scratch,
         &scratch,
         &scratch,
         &entry.common.completions,
@@ -265,6 +273,8 @@ mod tests {
                 eval: None,
                 completions: CompletionsSpec::Enabled(false),
                 setup: None,
+                lazy: false,
+                bind: None,
             },
         }
     }

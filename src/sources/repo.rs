@@ -2,17 +2,17 @@
 
 use std::fs;
 
-use anyhow::Context;
+use anyhow::{Context, anyhow, bail};
 use time::OffsetDateTime;
 
-use crate::config::RepoEntry;
+use crate::config::{self, RepoEntry};
 use crate::lock::{Lock, ToolLock};
 use crate::paths::Layout;
-use crate::version::github;
+use crate::version::github::{self, Asset};
 
 use super::{
-    Phase, collect_artifacts, download, extract, finalize_partial, run_setup, select_asset,
-    tool_key,
+    AssetPick, Phase, collect_artifacts, download, extract, finalize_partial, run_setup,
+    select_asset, tool_key,
 };
 
 /// Runs the full install flow; regenerating init.zsh is the caller's job.
@@ -24,12 +24,46 @@ pub fn install(
     phase: Phase,
 ) -> anyhow::Result<ToolLock> {
     let tool = tool_key(&entry.name);
+    println!(
+        "installing {} via {} release",
+        entry.name,
+        entry.host.prefix()
+    );
 
     let release = github::latest_release(&entry.name, entry.host)
         .with_context(|| format!("failed to resolve latest release for {}", entry.name))?;
-    let asset = select_asset(&release.assets, entry.bpick.as_ref())
-        .with_context(|| format!("failed to pick a release asset for {}", entry.name))?;
+    let asset = match select_asset(&release.assets, entry.bpick.as_ref()) {
+        AssetPick::Found(asset) => asset,
+        AssetPick::NoMatch {
+            bpick_configured,
+            relevant,
+            all,
+        } => {
+            let headline = if bpick_configured {
+                "no release asset matches bpick"
+            } else {
+                "no release asset auto-matches your platform — bpick not set"
+            };
+            let body = no_match_body(
+                entry,
+                layout,
+                &release.tag,
+                bpick_configured,
+                &relevant,
+                all,
+            );
+            return Err(anyhow!(body).context(headline));
+        }
+        AssetPick::Ambiguous(matches) => {
+            let list: String = matches
+                .iter()
+                .map(|a| format!("\n    - {}", a.name))
+                .collect();
+            bail!("bpick matches multiple assets, narrow it:{list}");
+        }
+    };
 
+    println!("  picked asset: {}", asset.name);
     let cache_path = layout.cache_dir.join(&asset.name);
     download(&asset.url, &cache_path, asset.size)
         .with_context(|| format!("failed to download {}", asset.name))?;
@@ -93,6 +127,56 @@ pub fn install(
     })
 }
 
+/// Builds the config-diff body for a failed asset pick — the one place
+/// with both the release version and config path needed to suggest a fix.
+fn no_match_body(
+    entry: &RepoEntry,
+    layout: &Layout,
+    version: &str,
+    bpick_configured: bool,
+    relevant: &[&Asset],
+    all: &[Asset],
+) -> String {
+    if let Some(value) = suggest_bpick(relevant, version)
+        && let Some(diff) =
+            config::render_entry_diff(&layout.config_path, &entry.name, "bpick", Some(&value))
+    {
+        return format!("{}\n{diff}", layout.config_path.display());
+    }
+
+    let candidates: Vec<&Asset> = if relevant.is_empty() {
+        all.iter().collect()
+    } else {
+        relevant.to_vec()
+    };
+    let list: String = candidates
+        .iter()
+        .map(|a| format!("\n    - {}", a.name))
+        .collect();
+    let suffix = if bpick_configured {
+        ""
+    } else {
+        " — set `bpick` explicitly"
+    };
+    format!("no asset matches your platform{suffix}\navailable assets:{list}")
+}
+
+/// `foo-15.2.0-linux.tar.gz` -> `foo-*-linux.tar.gz`, so the fix survives
+/// future releases instead of pinning this exact version.
+fn suggest_bpick(relevant: &[&Asset], version: &str) -> Option<String> {
+    let extractable = |name: &str| {
+        name.ends_with(".tar.gz")
+            || name.ends_with(".tgz")
+            || name.ends_with(".zip")
+            || name.ends_with(".deb")
+    };
+    let candidate = relevant.iter().find(|a| extractable(&a.name))?;
+    candidate
+        .name
+        .contains(version)
+        .then(|| candidate.name.replacen(version, "*", 1))
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -121,6 +205,8 @@ mod tests {
                 eval: None,
                 completions: CompletionsSpec::Enabled(true),
                 setup: None,
+                lazy: false,
+                bind: None,
             },
         }
     }

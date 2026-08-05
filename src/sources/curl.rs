@@ -20,6 +20,7 @@ const USER_AGENT: &str = concat!("rig/", env!("CARGO_PKG_VERSION"));
 
 pub fn install(entry: &CurlEntry, layout: &Layout, phase: Phase) -> anyhow::Result<ToolLock> {
     let tool = tool_key(&entry.name);
+    println!("installing {} via curl ({})", entry.name, entry.url);
     let script = fetch_script(&entry.url)?;
 
     let work_dir = layout.tool_pkg_dir(tool).join("install");
@@ -59,6 +60,7 @@ pub fn install(entry: &CurlEntry, layout: &Layout, phase: Phase) -> anyhow::Resu
         &format!("running {tool}'s install script"),
     )?;
     let completions = collect_completions(
+        &work_dir,
         &work_dir,
         &work_dir,
         &entry.common.completions,

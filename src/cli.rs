@@ -1,6 +1,7 @@
 //! Subcommand dispatch: install/update/remove/list/sync/doctor/which.
 //! `main.rs` is a one-line wrapper around `run`.
 use std::fs;
+use std::io::IsTerminal as _;
 use std::process::ExitCode;
 
 use anyhow::{Context as _, anyhow, bail};
@@ -42,27 +43,68 @@ enum Command {
     Doctor,
     /// Resolve a command name to the tool that provides it
     Which { command: String },
+    /// Print a shell completion script for `rig` itself
+    Completions { shell: clap_complete::Shell },
 }
 
 pub fn run() -> ExitCode {
     match dispatch(Cli::parse().command) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(e) => {
-            eprintln!("error: {e:?}");
+            print_error(None, &e);
             ExitCode::FAILURE
         }
     }
 }
 
-fn dispatch(command: Command) -> anyhow::Result<()> {
+/// Replaces anyhow's `{:?}` "Caused by:" chain — every `bail!` here is
+/// already a self-contained sentence, so print it as plain paragraphs.
+/// Color lives only here, never in the message text itself (which also
+/// flows through `.to_string()` in tests and could end up in a log file).
+fn print_error(prefix: Option<&str>, err: &anyhow::Error) {
+    let color = std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    let (bold_red, bold_green, dim, reset) = if color {
+        ("\x1b[1;31m", "\x1b[1;32m", "\x1b[2m", "\x1b[0m")
+    } else {
+        ("", "", "", "")
+    };
+
+    let mut chain = err.chain();
+    let head = chain.next().expect("anyhow::Error always has a message");
+    match prefix {
+        Some(p) => eprintln!("{bold_red}{p}:{reset} {head}"),
+        None => eprintln!("{bold_red}error:{reset} {head}"),
+    }
+    for cause in chain {
+        for line in cause.to_string().lines() {
+            // `- `/`+ `/`| ` come from config.rs::render_entry_diff — old
+            // value, suggested value, reproduced context; else stays dim.
+            if let Some(rest) = line.strip_prefix("- ") {
+                eprintln!("{bold_red}  - {rest}{reset}");
+            } else if let Some(rest) = line.strip_prefix("+ ") {
+                eprintln!("{bold_green}  + {rest}{reset}");
+            } else if let Some(rest) = line.strip_prefix("| ") {
+                eprintln!("    {rest}");
+            } else {
+                eprintln!("{dim}  {line}{reset}");
+            }
+        }
+    }
+}
+
+fn dispatch(command: Command) -> anyhow::Result<ExitCode> {
     match command {
         Command::Install { tools } => cmd_install(tools),
         Command::Update { tools, force } => cmd_update(tools, force),
         Command::Remove { tools } => cmd_remove(tools),
-        Command::List => cmd_list(),
+        Command::List => cmd_list().map(|()| ExitCode::SUCCESS),
         Command::Sync => cmd_sync(),
-        Command::Doctor => cmd_doctor(),
-        Command::Which { command } => cmd_which(command),
+        Command::Doctor => cmd_doctor().map(|()| ExitCode::SUCCESS),
+        Command::Which { command } => cmd_which(command).map(|()| ExitCode::SUCCESS),
+        Command::Completions { shell } => {
+            cmd_completions(shell);
+            Ok(ExitCode::SUCCESS)
+        }
     }
 }
 
@@ -92,7 +134,7 @@ impl Ctx {
     }
 }
 
-fn cmd_install(tools: Vec<String>) -> anyhow::Result<()> {
+fn cmd_install(tools: Vec<String>) -> anyhow::Result<ExitCode> {
     if tools.is_empty() {
         bail!("specify at least one tool to install");
     }
@@ -106,15 +148,16 @@ fn cmd_install(tools: Vec<String>) -> anyhow::Result<()> {
             Ok(()) => {}
             Err(e) => {
                 failed = true;
-                eprintln!("{name}: error: {e:?}");
+                print_error(Some(name), &e);
             }
         }
     }
 
-    if failed {
-        bail!("one or more tools failed to install");
-    }
-    Ok(())
+    Ok(if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    })
 }
 
 fn install_one(ctx: &mut Ctx, requested: &str) -> anyhow::Result<()> {
@@ -161,7 +204,7 @@ fn install_one(ctx: &mut Ctx, requested: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_update(tools: Vec<String>, force: bool) -> anyhow::Result<()> {
+fn cmd_update(tools: Vec<String>, force: bool) -> anyhow::Result<ExitCode> {
     let mut ctx = Ctx::load()?;
     let filter = (!tools.is_empty()).then_some(tools.as_slice());
     let reports = update::update_all(&ctx.config, &mut ctx.lock, &ctx.layout, force, filter);
@@ -172,29 +215,34 @@ fn cmd_update(tools: Vec<String>, force: bool) -> anyhow::Result<()> {
             Ok(outcome) => println!("{}: {}", report.tool, describe_outcome(outcome)),
             Err(e) => {
                 failed = true;
-                eprintln!("{}: error: {e:?}", report.tool);
+                print_error(Some(&report.tool), e);
             }
         }
     }
 
-    for plugin in &ctx.config.plugin {
-        let dest = ctx.layout.plugins_dir.join(config::tool_key(&plugin.name));
-        if !dest.exists() {
-            continue; // not cloned yet — `rig sync` handles that, not update
-        }
-        match sources::plugin::update(plugin, &ctx.layout) {
-            Ok(()) => println!("{}: pulled", plugin.name),
-            Err(e) => {
-                failed = true;
-                eprintln!("{}: error: {e:?}", plugin.name);
+    // Plugins have no `ResolvedEntry`/key, so a specific `rig update <tool>`
+    // can never mean "and this plugin too" — only a bare `rig update` does.
+    if filter.is_none() {
+        for plugin in &ctx.config.plugin {
+            let dest = ctx.layout.plugins_dir.join(config::tool_key(&plugin.name));
+            if !dest.exists() {
+                continue; // not cloned yet — `rig sync` handles that, not update
+            }
+            match sources::plugin::update(plugin, &ctx.layout) {
+                Ok(()) => println!("{}: pulled", plugin.name),
+                Err(e) => {
+                    failed = true;
+                    print_error(Some(&plugin.name), &e);
+                }
             }
         }
     }
 
-    if failed {
-        bail!("one or more tools failed to update");
-    }
-    Ok(())
+    Ok(if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    })
 }
 
 fn describe_outcome(outcome: &update::Outcome) -> String {
@@ -205,7 +253,7 @@ fn describe_outcome(outcome: &update::Outcome) -> String {
     }
 }
 
-fn cmd_remove(tools: Vec<String>) -> anyhow::Result<()> {
+fn cmd_remove(tools: Vec<String>) -> anyhow::Result<ExitCode> {
     if tools.is_empty() {
         bail!("specify at least one tool to remove");
     }
@@ -217,15 +265,16 @@ fn cmd_remove(tools: Vec<String>) -> anyhow::Result<()> {
             Ok(()) => {}
             Err(e) => {
                 failed = true;
-                eprintln!("{name}: error: {e:?}");
+                print_error(Some(name), &e);
             }
         }
     }
 
-    if failed {
-        bail!("one or more tools failed to remove");
-    }
-    Ok(())
+    Ok(if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    })
 }
 
 fn remove_one(ctx: &mut Ctx, requested: &str) -> anyhow::Result<()> {
@@ -245,7 +294,9 @@ fn remove_one(ctx: &mut Ctx, requested: &str) -> anyhow::Result<()> {
 
 fn cmd_list() -> anyhow::Result<()> {
     let ctx = Ctx::load()?;
-    for entry in config::all_entries(&ctx.config) {
+    let entries = config::all_entries(&ctx.config);
+    let width = entries.iter().map(|e| e.key().len()).max().unwrap_or(0);
+    for entry in &entries {
         let key = entry.key();
         let marker = if ctx.lock.tool.contains_key(&key) {
             "\u{25cf}"
@@ -253,7 +304,7 @@ fn cmd_list() -> anyhow::Result<()> {
             "\u{25cb}"
         };
         match &entry.common().description {
-            Some(desc) => println!("{marker} {key}  {desc}"),
+            Some(desc) => println!("{marker} {key:width$}  {desc}"),
             None => println!("{marker} {key}"),
         }
     }
@@ -262,7 +313,7 @@ fn cmd_list() -> anyhow::Result<()> {
 
 /// Plugins aren't installed on demand like binaries — `sync` clones any
 /// that are missing so their `source` line in init.zsh resolves.
-fn cmd_sync() -> anyhow::Result<()> {
+fn cmd_sync() -> anyhow::Result<ExitCode> {
     let ctx = Ctx::load()?;
 
     let old_keys = fs::read_to_string(&ctx.layout.init_zsh_path)
@@ -279,17 +330,37 @@ fn cmd_sync() -> anyhow::Result<()> {
             Ok(()) => println!("cloned plugin {}", plugin.name),
             Err(e) => {
                 failed = true;
-                eprintln!("{}: error: {e:?}", plugin.name);
+                print_error(Some(&plugin.name), &e);
             }
         }
     }
 
     ctx.save()?;
+    write_own_completions(&ctx.layout)?;
     report_tool_set_diff(&old_keys, &ctx.config);
-    if failed {
-        bail!("one or more plugins failed to clone");
-    }
-    Ok(())
+    Ok(if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+fn cmd_completions(shell: clap_complete::Shell) {
+    let mut cmd = <Cli as clap::CommandFactory>::command();
+    let name = cmd.get_name().to_string();
+    clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
+}
+
+/// `rig` isn't installed via its own `[[repo]]`/`[[cargo]]` flow, so nothing
+/// else keeps its completions in `completions_dir` current — sync does it.
+fn write_own_completions(layout: &Layout) -> anyhow::Result<()> {
+    let mut cmd = <Cli as clap::CommandFactory>::command();
+    let mut buf = Vec::new();
+    clap_complete::generate(clap_complete::Shell::Zsh, &mut cmd, "rig", &mut buf);
+    fs::create_dir_all(&layout.completions_dir)
+        .with_context(|| format!("failed to create {}", layout.completions_dir.display()))?;
+    let dest = layout.completions_dir.join("_rig");
+    fs::write(&dest, buf).with_context(|| format!("failed to write {}", dest.display()))
 }
 
 /// `rig sync` can fire unattended on shell startup — this is the only

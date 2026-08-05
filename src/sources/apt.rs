@@ -18,8 +18,8 @@ pub fn install(entry: &AptEntry, layout: &Layout, phase: Phase) -> anyhow::Resul
     let tool = tool_key(&entry.name);
 
     eprintln!(
-        "warning: installing {} via `sudo apt-get install` — outside rig's own \
-         pkg tree, uninstall will be incomplete",
+        "installing {} via `sudo apt-get install` — outside rig's own pkg tree, \
+         `rig remove` will run `apt-get remove` to undo it",
         entry.name
     );
     let mut command = Command::new("sudo");
@@ -51,6 +51,7 @@ pub fn install(entry: &AptEntry, layout: &Layout, phase: Phase) -> anyhow::Resul
         &format!("installing {}", entry.name),
     )?;
     let completions = collect_completions(
+        &scratch,
         &scratch,
         &scratch,
         &entry.common.completions,

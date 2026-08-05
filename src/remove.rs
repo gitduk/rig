@@ -15,6 +15,8 @@ use crate::sources::node::ResolvedManager;
 pub fn remove(tool: &ToolLock, layout: &Layout) -> anyhow::Result<()> {
     if let Some(manager) = &tool.manager {
         uninstall_node_package(tool, manager)?;
+    } else if tool.source.starts_with("apt:") {
+        uninstall_apt_package(tool)?;
     }
     for bin in &tool.bins {
         remove_owned_symlink(Path::new(bin), layout)?;
@@ -49,6 +51,24 @@ fn uninstall_node_package(tool: &ToolLock, manager: &str) -> anyhow::Result<()> 
         .with_context(|| format!("failed to run `{bin} {verb} -g {name}`"))?;
     if !status.success() {
         bail!("`{bin} {verb} -g {name}` failed ({status})");
+    }
+    Ok(())
+}
+
+/// An apt package's files are placed by dpkg outside `state_dir` (see
+/// `sources::apt`'s doc comment), so only `apt-get remove` can undo it.
+fn uninstall_apt_package(tool: &ToolLock) -> anyhow::Result<()> {
+    let name = tool
+        .source
+        .strip_prefix("apt:")
+        .with_context(|| format!("malformed apt source in rig.lock: {}", tool.source))?;
+    eprintln!("removing {name} via `sudo apt-get remove -y`");
+    let status = Command::new("sudo")
+        .args(["apt-get", "remove", "-y", name])
+        .status()
+        .with_context(|| format!("failed to run `sudo apt-get remove -y {name}`"))?;
+    if !status.success() {
+        bail!("apt-get remove -y {name} failed ({status})");
     }
     Ok(())
 }
@@ -95,6 +115,14 @@ mod tests {
             eval_cached_output: None,
             eval_evidence: Vec::new(),
         }
+    }
+
+    #[test]
+    fn uninstall_apt_package_rejects_a_malformed_source() {
+        let mut tool = tool_lock(Vec::new(), None);
+        tool.source = "cargo:ripgrep".to_string();
+        let err = uninstall_apt_package(&tool).expect_err("source has no apt: prefix");
+        assert!(err.to_string().contains("cargo:ripgrep"));
     }
 
     #[test]

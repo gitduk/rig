@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -73,13 +73,42 @@ pub fn load_or_default(path: &Path) -> anyhow::Result<Lock> {
     }
 }
 
-pub fn save(lock: &Lock, path: &Path) -> anyhow::Result<()> {
-    let text = toml::to_string_pretty(lock).context("failed to serialize rig.lock")?;
+/// `fs::write` truncates in place, so a disk-full write can destroy the
+/// old content before the new content lands. Temp file + `rename` instead.
+fn atomic_write(path: &Path, contents: &str) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    fs::write(path, text).with_context(|| format!("failed to write {}", path.display()))
+    if path.exists() {
+        let backup = backup_path(path);
+        fs::copy(path, &backup).with_context(|| {
+            format!(
+                "failed to back up {} to {}",
+                path.display(),
+                backup.display()
+            )
+        })?;
+    }
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let tmp = path.with_extension(format!("{ext}.tmp.{}", std::process::id()));
+    fs::write(&tmp, contents).with_context(|| format!("failed to write {}", tmp.display()))?;
+    fs::rename(&tmp, path).with_context(|| format!("failed to move {} into place", path.display()))
+}
+
+/// `rig.lock` -> `.rig.lock`: one-generation rollback for a bad-but-valid
+/// write, which `atomic_write` alone can't catch.
+fn backup_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("backup");
+    path.with_file_name(format!(".{file_name}"))
+}
+
+pub fn save(lock: &Lock, path: &Path) -> anyhow::Result<()> {
+    let text = toml::to_string_pretty(lock).context("failed to serialize rig.lock")?;
+    atomic_write(path, &text)
 }
 
 /// Lock must land before init.zsh. Call after every tool, not once at
@@ -87,12 +116,7 @@ pub fn save(lock: &Lock, path: &Path) -> anyhow::Result<()> {
 pub fn save_and_sync(config: &Config, lock: &Lock, layout: &Layout) -> anyhow::Result<()> {
     save(lock, &layout.lock_path)?;
     let rendered = initzsh::render(config, lock, layout);
-    if let Some(parent) = layout.init_zsh_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    fs::write(&layout.init_zsh_path, rendered)
-        .with_context(|| format!("failed to write {}", layout.init_zsh_path.display()))
+    atomic_write(&layout.init_zsh_path, &rendered)
 }
 
 #[cfg(test)]
@@ -177,5 +201,44 @@ mod tests {
 
         assert!(layout.lock_path.exists());
         assert!(layout.init_zsh_path.exists());
+    }
+
+    #[test]
+    fn save_backs_up_the_previous_generation() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("rig.lock");
+        let backup = tmp.path().join(".rig.lock");
+
+        let mut lock = Lock::default();
+        save(&lock, &path).expect("first save");
+        assert!(!backup.exists(), "nothing to back up on first save");
+
+        lock.tool.insert(
+            "delta".to_string(),
+            ToolLock {
+                version: "0.18.2".to_string(),
+                source: "github:dandavison/delta".to_string(),
+                installed_at: ts("2026-08-03T12:00:00Z"),
+                bins: vec!["~/.local/bin/delta".to_string()],
+                completions: vec![],
+                asset: None,
+                size: None,
+                pkg: None,
+                manager: None,
+                root: None,
+                eval_cacheable: None,
+                eval_cached_output: None,
+                eval_evidence: Vec::new(),
+            },
+        );
+        save(&lock, &path).expect("second save");
+
+        let backed_up = fs::read_to_string(&backup).expect("backup exists after second save");
+        assert!(
+            !backed_up.contains("delta"),
+            "backup should hold the pre-update (empty) lock, not the new one"
+        );
+        let current = fs::read_to_string(&path).expect("current lock exists");
+        assert!(current.contains("delta"));
     }
 }

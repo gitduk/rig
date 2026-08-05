@@ -28,6 +28,10 @@ pub use crate::config::tool_key;
 
 const USER_AGENT: &str = concat!("rig/", env!("CARGO_PKG_VERSION"));
 
+/// `Layout::new` hardcodes this same path unconditionally — no override
+/// mechanism exists, so error messages can name it as a literal.
+const CONFIG_PATH_HINT: &str = "~/.config/rig/config.toml";
+
 /// Applies configured `env` to an install subprocess — never inherit-only,
 /// or install location depends on the caller's shell.
 pub fn apply_env(cmd: &mut Command, env: &HashMap<String, String>) -> anyhow::Result<()> {
@@ -71,41 +75,58 @@ pub fn resolve_declared_bins(
         .collect()
 }
 
-/// Explicit `bpick` wins; else a naive `<arch>-<os>` filter. Ambiguous or
-/// empty matches are reported, never guessed.
-pub fn select_asset<'a>(
-    assets: &'a [Asset],
-    bpick: Option<&BpickSpec>,
-) -> anyhow::Result<&'a Asset> {
-    if let Some(spec) = bpick {
-        let patterns: Vec<&str> = match spec {
-            BpickSpec::Single(p) => vec![p.as_str()],
-            BpickSpec::Multiple(ps) => ps.iter().map(String::as_str).collect(),
-        };
-        let matches: Vec<&Asset> = assets
-            .iter()
-            .filter(|a| patterns.iter().any(|p| glob_match(p, &a.name)))
-            .collect();
-        return one_match(matches, "bpick");
-    }
-
-    let arch = host_arch();
-    let os = host_os();
-    let matches: Vec<&Asset> = assets
-        .iter()
-        .filter(|a| a.name.contains(arch) && a.name.contains(os))
-        .collect();
-    one_match(matches, &format!("{arch}-{os}"))
+/// Shared by every "picked 0 or N>1 out of a known set" error, so they all
+/// render candidates as bullets instead of a raw `{:?}` dump.
+fn format_candidates<'a>(items: impl IntoIterator<Item = &'a str>) -> String {
+    items
+        .into_iter()
+        .map(|item| format!("\n    - {item}"))
+        .collect()
 }
 
-fn one_match<'a>(matches: Vec<&'a Asset>, criterion: &str) -> anyhow::Result<&'a Asset> {
-    match matches.len() {
-        0 => bail!("no release asset matches {criterion}; set `bpick` explicitly"),
-        1 => Ok(matches[0]),
-        _ => {
-            let names: Vec<&str> = matches.iter().map(|a| a.name.as_str()).collect();
-            bail!("{criterion} matches multiple assets, set `bpick` to disambiguate: {names:?}")
+/// Kept as data, not a formatted message — only the caller (`repo.rs`) has
+/// the release version and config path needed to suggest a real fix.
+pub enum AssetPick<'a> {
+    Found(&'a Asset),
+    NoMatch {
+        bpick_configured: bool,
+        /// Assets whose name contains this host's arch and OS — a release
+        /// lists every platform, and only these are relevant to suggest.
+        relevant: Vec<&'a Asset>,
+        all: &'a [Asset],
+    },
+    Ambiguous(Vec<&'a Asset>),
+}
+
+/// Explicit `bpick` wins; else a naive `<arch>-<os>` filter.
+pub fn select_asset<'a>(assets: &'a [Asset], bpick: Option<&BpickSpec>) -> AssetPick<'a> {
+    let arch = host_arch();
+    let os = host_os();
+    let is_host = |a: &&Asset| a.name.contains(arch) && a.name.contains(os);
+
+    let (matches, bpick_configured) = match bpick {
+        Some(spec) => {
+            let patterns: Vec<&str> = match spec {
+                BpickSpec::Single(p) => vec![p.as_str()],
+                BpickSpec::Multiple(ps) => ps.iter().map(String::as_str).collect(),
+            };
+            let matches: Vec<&Asset> = assets
+                .iter()
+                .filter(|a| patterns.iter().any(|p| glob_match(p, &a.name)))
+                .collect();
+            (matches, true)
         }
+        None => (assets.iter().filter(is_host).collect(), false),
+    };
+
+    match matches.len() {
+        1 => AssetPick::Found(matches[0]),
+        0 => AssetPick::NoMatch {
+            bpick_configured,
+            relevant: assets.iter().filter(is_host).collect(),
+            all: assets,
+        },
+        _ => AssetPick::Ambiguous(matches),
     }
 }
 
@@ -218,9 +239,26 @@ pub fn extract(archive: &Path, dest: &Path, extract_flag: Option<bool>) -> anyho
         extract_tar_gz(archive, dest)
     } else if name.ends_with(".zip") {
         extract_zip(archive, dest)
+    } else if name.ends_with(".deb") {
+        extract_deb(archive, dest)
     } else {
         bail!("don't know how to extract {name}; set `extract = false` if this is a raw binary")
     }
+}
+
+/// `.deb` is an `ar` archive wrapping `data.tar.*` — `dpkg-deb -x` unpacks
+/// straight to `dest` without touching the system package database.
+fn extract_deb(archive: &Path, dest: &Path) -> anyhow::Result<()> {
+    let status = Command::new("dpkg-deb")
+        .arg("-x")
+        .arg(archive)
+        .arg(dest)
+        .status()
+        .with_context(|| format!("failed to run `dpkg-deb -x {}`", archive.display()))?;
+    if !status.success() {
+        bail!("dpkg-deb -x {} failed ({status})", archive.display());
+    }
+    Ok(())
 }
 
 fn extract_tar_gz(archive: &Path, dest: &Path) -> anyhow::Result<()> {
@@ -291,9 +329,27 @@ fn find_by_name(files: &[PathBuf], name: &str) -> anyhow::Result<PathBuf> {
         .filter(|p| p.file_name().and_then(|n| n.to_str()) == Some(name))
         .collect();
     match matches.len() {
-        0 => bail!("no file named {name} found in the unpacked archive"),
+        0 => {
+            let present: Vec<String> = files
+                .iter()
+                .filter_map(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .collect();
+            let list = format_candidates(present.iter().map(String::as_str));
+            bail!(
+                "no file named {name} found in the unpacked archive\nfiles present:{list}\n\
+                 fix: set `bin` for this tool in {CONFIG_PATH_HINT}"
+            )
+        }
         1 => Ok(matches[0].clone()),
-        _ => bail!("multiple files named {name} found in the unpacked archive: {matches:?}"),
+        _ => {
+            let paths: Vec<String> = matches.iter().map(|p| p.display().to_string()).collect();
+            let list = format_candidates(paths.iter().map(String::as_str));
+            bail!(
+                "multiple files named {name} found in the unpacked archive:{list}\n\
+                 fix: narrow `bin` for this tool in {CONFIG_PATH_HINT}"
+            )
+        }
     }
 }
 
@@ -309,9 +365,31 @@ fn find_by_glob(root: &Path, files: &[PathBuf], pattern: &str) -> anyhow::Result
         })
         .collect();
     match matches.len() {
-        0 => bail!("no file matches `{pattern}` in the unpacked archive"),
+        0 => {
+            let present: Vec<String> = files
+                .iter()
+                .filter_map(|p| p.strip_prefix(root).ok())
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect();
+            let list = format_candidates(present.iter().map(String::as_str));
+            bail!(
+                "no file matches `{pattern}` in the unpacked archive\nfiles present:{list}\n\
+                 fix: edit `bin` for this tool in {CONFIG_PATH_HINT}"
+            )
+        }
         1 => Ok(matches[0].clone()),
-        _ => bail!("`{pattern}` matches multiple files in the unpacked archive: {matches:?}"),
+        _ => {
+            let paths: Vec<String> = matches
+                .iter()
+                .filter_map(|p| p.strip_prefix(root).ok())
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect();
+            let list = format_candidates(paths.iter().map(String::as_str));
+            bail!(
+                "`{pattern}` matches multiple files in the unpacked archive:{list}\n\
+                 fix: narrow `bin` for this tool in {CONFIG_PATH_HINT}"
+            )
+        }
     }
 }
 
@@ -321,6 +399,33 @@ fn rebase(path: &Path, from: &Path, to: &Path) -> PathBuf {
     match path.strip_prefix(from) {
         Ok(rel) => to.join(rel),
         Err(_) => path.to_path_buf(),
+    }
+}
+
+/// `collect_bins`'s resolution step, exposed so callers can find where the
+/// bin landed without duplicating the `BinSpec` match.
+fn resolve_bin_sources(
+    search_dir: &Path,
+    bin_spec: Option<&BinSpec>,
+    default_name: &str,
+) -> anyhow::Result<Vec<(String, PathBuf)>> {
+    let files = walk_files(search_dir)?;
+    match bin_spec {
+        None => Ok(vec![(
+            default_name.to_string(),
+            find_by_name(&files, default_name)?,
+        )]),
+        Some(BinSpec::Single(name)) => Ok(vec![(name.clone(), find_by_name(&files, name)?)]),
+        Some(BinSpec::Multiple(names)) => names
+            .iter()
+            .map(|name| find_by_name(&files, name).map(|p| (name.clone(), p)))
+            .collect(),
+        Some(BinSpec::Mapped(map)) => map
+            .iter()
+            .map(|(pattern, cmd)| {
+                find_by_glob(search_dir, &files, pattern).map(|p| (cmd.clone(), p))
+            })
+            .collect(),
     }
 }
 
@@ -334,25 +439,7 @@ pub fn collect_bins(
     prefix_bin_dir: &Path,
     lock: &Lock,
 ) -> anyhow::Result<Vec<(PathBuf, PathBuf)>> {
-    let files = walk_files(search_dir)?;
-
-    let resolved: Vec<(String, PathBuf)> = match bin_spec {
-        None => vec![(
-            default_name.to_string(),
-            find_by_name(&files, default_name)?,
-        )],
-        Some(BinSpec::Single(name)) => vec![(name.clone(), find_by_name(&files, name)?)],
-        Some(BinSpec::Multiple(names)) => names
-            .iter()
-            .map(|name| find_by_name(&files, name).map(|p| (name.clone(), p)))
-            .collect::<anyhow::Result<_>>()?,
-        Some(BinSpec::Mapped(map)) => map
-            .iter()
-            .map(|(pattern, cmd)| {
-                find_by_glob(search_dir, &files, pattern).map(|p| (cmd.clone(), p))
-            })
-            .collect::<anyhow::Result<_>>()?,
-    };
+    let resolved = resolve_bin_sources(search_dir, bin_spec, default_name)?;
 
     fs::create_dir_all(prefix_bin_dir)
         .with_context(|| format!("failed to create {}", prefix_bin_dir.display()))?;
@@ -406,6 +493,7 @@ fn symlink_replacing(source: &Path, target: &Path) -> anyhow::Result<()> {
 /// `completions_dir` against `link_root` — same rationale as `collect_bins`.
 pub fn collect_completions(
     search_dir: &Path,
+    generate_cwd: &Path,
     link_root: &Path,
     spec: &CompletionsSpec,
     completions_dir: &Path,
@@ -426,7 +514,7 @@ pub fn collect_completions(
             link_completions(std::slice::from_ref(&source), completions_dir)
         }
         CompletionsSpec::Generate { generate } => {
-            run_shell(generate, search_dir, env)?;
+            run_shell(generate, generate_cwd, env)?;
             let files = walk_files(search_dir)?;
             let sources: Vec<PathBuf> = underscore_files(&files)
                 .into_iter()
@@ -583,8 +671,17 @@ pub fn collect_artifacts(
         lock,
     )
     .with_context(|| format!("failed to collect binaries for {tool}"))?;
+
+    // `./tool ...` in a `generate` command must run where the archive
+    // actually placed the bin, not always the extraction root.
+    let generate_cwd = resolve_bin_sources(search_dir, common.bin.as_ref(), tool)
+        .ok()
+        .and_then(|resolved| resolved.into_iter().next())
+        .and_then(|(_, source)| source.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| search_dir.to_path_buf());
     let completions = collect_completions(
         search_dir,
+        &generate_cwd,
         link_root,
         &common.completions,
         completions_dir,
@@ -661,25 +758,38 @@ mod tests {
             asset("delta-x86_64-unknown-linux-musl.tar.gz"),
         ];
         let bpick = BpickSpec::Single("*-musl.tar.gz".to_string());
-        let picked = select_asset(&assets, Some(&bpick)).expect("bpick should match one asset");
+        let AssetPick::Found(picked) = select_asset(&assets, Some(&bpick)) else {
+            panic!("bpick should match exactly one asset");
+        };
         assert!(picked.name.contains("musl"));
     }
 
     #[test]
-    fn select_asset_errors_on_ambiguous_host_match() {
+    fn select_asset_reports_ambiguous_host_match() {
         let assets = vec![
             asset("delta-x86_64-unknown-linux-gnu.tar.gz"),
             asset("delta-x86_64-unknown-linux-musl.tar.gz"),
         ];
-        let err = select_asset(&assets, None).expect_err("gnu and musl both match x86_64-linux");
-        assert!(err.to_string().contains("multiple assets"));
+        let AssetPick::Ambiguous(matches) = select_asset(&assets, None) else {
+            panic!("gnu and musl should both match x86_64-linux");
+        };
+        assert_eq!(matches.len(), 2);
     }
 
     #[test]
-    fn select_asset_errors_when_nothing_matches() {
+    fn select_asset_reports_no_match_with_relevant_empty() {
         let assets = vec![asset("delta-aarch64-apple-darwin.tar.gz")];
-        let err = select_asset(&assets, None).expect_err("darwin build shouldn't match linux host");
-        assert!(err.to_string().contains("no release asset matches"));
+        let AssetPick::NoMatch {
+            bpick_configured,
+            relevant,
+            all,
+        } = select_asset(&assets, None)
+        else {
+            panic!("darwin build shouldn't match linux host");
+        };
+        assert!(!bpick_configured);
+        assert!(relevant.is_empty());
+        assert_eq!(all.len(), 1);
     }
 
     #[test]
@@ -715,6 +825,54 @@ mod tests {
     }
 
     #[test]
+    fn generate_completions_run_from_where_the_bin_actually_landed() {
+        // uv-style layout: the archive wraps everything in a version dir,
+        // so `./uv ...` from search_dir's root would find nothing there.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let search_dir = tmp.path().join("partial");
+        let wrapped = search_dir.join("uv-x86_64-unknown-linux-gnu");
+        fs::create_dir_all(&wrapped).expect("mkdir wrapped dir");
+
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = "#!/bin/sh\necho '#compdef uv' > _uv\n";
+        let bin_path = wrapped.join("uv");
+        fs::write(&bin_path, script).expect("write fake uv");
+        let mut perms = fs::metadata(&bin_path).expect("stat").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&bin_path, perms).expect("chmod +x");
+
+        let common = Common {
+            description: None,
+            bin: Some(BinSpec::Single("uv".to_string())),
+            env: HashMap::new(),
+            eval: None,
+            completions: CompletionsSpec::Generate {
+                generate: "./uv --dummy".to_string(),
+            },
+            setup: None,
+            lazy: false,
+            bind: None,
+        };
+        let lock = Lock::default();
+        let artifacts = collect_artifacts(
+            &search_dir,
+            &search_dir,
+            &common,
+            "uv",
+            &tmp.path().join("bin"),
+            &tmp.path().join("completions"),
+            &lock,
+        )
+        .expect("generate command should find ./uv in its own directory");
+
+        assert_eq!(artifacts.completions.len(), 1);
+        let generated =
+            fs::read_to_string(wrapped.join("_uv")).expect("_uv should exist next to the bin");
+        assert_eq!(generated.trim(), "#compdef uv");
+    }
+
+    #[test]
     fn a_failed_collect_never_destroys_the_old_version() {
         // finalize_partial must never run before collect_artifacts succeeds
         // — otherwise a collect failure leaves neither version intact.
@@ -747,6 +905,8 @@ mod tests {
             eval: None,
             completions: CompletionsSpec::Enabled(false),
             setup: None,
+            lazy: false,
+            bind: None,
         };
         let result = collect_artifacts(
             &partial_dir,

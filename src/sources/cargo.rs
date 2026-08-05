@@ -22,6 +22,7 @@ pub fn install(
     phase: Phase,
 ) -> anyhow::Result<ToolLock> {
     let tool = tool_key(&entry.name);
+    println!("installing {} via cargo", entry.name);
     let version = crates_io::latest_version(&entry.name)
         .with_context(|| format!("failed to resolve latest version for {}", entry.name))?;
 
@@ -33,6 +34,7 @@ pub fn install(
             .with_context(|| format!("failed to remove stale {}", partial_dir.display()))?;
     }
 
+    println!("  cargo install --version {version} {}", entry.name);
     let mut command = Command::new("cargo");
     command
         .arg("install")
@@ -110,6 +112,8 @@ mod tests {
                 eval: None,
                 completions: CompletionsSpec::Enabled(false),
                 setup: None,
+                lazy: false,
+                bind: None,
             },
         }
     }

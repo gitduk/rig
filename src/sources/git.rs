@@ -88,6 +88,7 @@ pub fn install(
         fs::remove_dir_all(&partial_dir)
             .with_context(|| format!("failed to remove stale {}", partial_dir.display()))?;
     }
+    println!("installing {} via git (git clone {url})", entry.name);
     git_clone(&url, &partial_dir, &entry.common.env)?;
 
     if let Some(setup) = &entry.common.setup {
@@ -175,6 +176,8 @@ mod tests {
                 eval: None,
                 completions: CompletionsSpec::Enabled(false),
                 setup: None,
+                lazy: false,
+                bind: None,
             },
         };
 

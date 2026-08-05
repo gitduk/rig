@@ -58,6 +58,13 @@ pub struct Common {
     #[serde(default = "default_completions")]
     pub completions: CompletionsSpec,
     pub setup: Option<SetupSpec>,
+    /// Defers `env`/`eval` to first use of the tool's own command name —
+    /// wrong for tools whose hooks must observe events from session start.
+    #[serde(default)]
+    pub lazy: bool,
+    /// Only meaningful with `lazy`: `"key:widget"` — placeholder ZLE widget
+    /// that runs the deferred setup, then rebinds `key` to the real one.
+    pub bind: Option<String>,
 }
 
 /// Three TOML shapes for one field, resolved via untagged.
@@ -320,6 +327,55 @@ pub fn load(path: &Path) -> anyhow::Result<Config> {
     let text =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
     parse(&text).with_context(|| format!("failed to parse {}", path.display()))
+}
+
+/// `toml::from_str` discards source spans, so this re-reads as text and
+/// marks `key`'s line git-diff style: `-` old value, `+` `replacement`.
+pub fn render_entry_diff(
+    config_path: &Path,
+    name: &str,
+    key: &str,
+    replacement: Option<&str>,
+) -> Option<String> {
+    let text = fs::read_to_string(config_path).ok()?;
+    let lines: Vec<&str> = text.lines().collect();
+    let name_line = format!("name = \"{name}\"");
+
+    let name_idx = lines.iter().position(|l| l.trim() == name_line)?;
+    let start = (0..name_idx)
+        .rev()
+        .find(|&i| lines[i].trim_start().starts_with("[["))?;
+    let end = lines[start + 1..]
+        .iter()
+        .position(|l| l.trim_start().starts_with("[["))
+        .map_or(lines.len(), |offset| start + 1 + offset);
+
+    let block: Vec<&str> = lines[start..end]
+        .iter()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect();
+    let key_prefix = format!("{key} =");
+    let key_exists = block.iter().any(|l| l.starts_with(&key_prefix));
+
+    let mut out = Vec::new();
+    for &line in &block {
+        if line.starts_with(&key_prefix) {
+            out.push(format!("- {line}"));
+            if let Some(value) = replacement {
+                out.push(format!("+ {key} = \"{value}\""));
+            }
+        } else {
+            out.push(format!("| {line}"));
+            if !key_exists
+                && line == name_line
+                && let Some(value) = replacement
+            {
+                out.push(format!("+ {key} = \"{value}\""));
+            }
+        }
+    }
+    Some(out.join("\n"))
 }
 
 #[cfg(test)]
