@@ -229,8 +229,7 @@ fn install_via_npm(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Common, CompletionsSpec};
-    use std::collections::HashMap;
+    use crate::config::{self, Common, CompletionsSpec};
 
     #[test]
     fn manager_round_trips_through_its_recorded_name() {
@@ -267,14 +266,8 @@ mod tests {
             name: "cowsay".to_string(),
             manager: NodeManager::Bun,
             common: Common {
-                description: None,
-                bin: None,
-                env: HashMap::new(),
-                eval: None,
                 completions: CompletionsSpec::Enabled(false),
-                setup: None,
-                lazy: false,
-                bind: None,
+                ..config::test_common()
             },
         }
     }

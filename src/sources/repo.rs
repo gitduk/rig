@@ -182,7 +182,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::config::{BpickSpec, Common, CompletionsSpec, Host};
+    use crate::config::{BpickSpec, Common, Host};
 
     #[test]
     fn tool_key_takes_the_last_path_segment() {
@@ -199,14 +199,7 @@ mod tests {
             )),
             extract: None,
             common: Common {
-                description: None,
-                bin: None,
-                env: std::collections::HashMap::new(),
-                eval: None,
-                completions: CompletionsSpec::Enabled(true),
-                setup: None,
-                lazy: false,
-                bind: None,
+                ..config::test_common()
             },
         }
     }

@@ -230,7 +230,7 @@ fn update_curl(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BpickSpec, Common, CompletionsSpec, Host};
+    use crate::config::{self, BpickSpec, Common, Host};
     use std::fs;
 
     fn delta_entry() -> RepoEntry {
@@ -242,14 +242,7 @@ mod tests {
             )),
             extract: None,
             common: Common {
-                description: None,
-                bin: None,
-                env: std::collections::HashMap::new(),
-                eval: None,
-                completions: CompletionsSpec::Enabled(true),
-                setup: None,
-                lazy: false,
-                bind: None,
+                ..config::test_common()
             },
         }
     }

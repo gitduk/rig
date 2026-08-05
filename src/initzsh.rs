@@ -31,6 +31,7 @@ pub fn render(config: &Config, lock: &Lock, layout: &Layout) -> String {
     let mut out = String::new();
     render_fpath(&mut out, layout);
     render_env(&mut out, &eager);
+    render_run(&mut out, &eager);
     render_rig_cmd_and_handler(&mut out, config, layout);
     render_eval_blocks(&mut out, &eager, lock);
     render_lazy_blocks(&mut out, config, lock);
@@ -53,6 +54,18 @@ fn render_env(out: &mut String, entries: &[(String, &Common)]) {
                 "export {key}=\"{}\"\n",
                 expand_tilde_export(value)
             ));
+        }
+    }
+    out.push('\n');
+}
+
+/// Plain shell text (e.g. an alias) — unlike `eval`, output isn't captured.
+fn render_run(out: &mut String, entries: &[(String, &Common)]) {
+    for (_, common) in entries {
+        let Some(run) = &common.run else { continue };
+        for line in run.lines() {
+            out.push_str(line);
+            out.push('\n');
         }
     }
     out.push('\n');
@@ -135,12 +148,13 @@ fn render_eval_text(eval: &EvalSpec, tool_lock: &ToolLock) -> String {
     }
 }
 
-/// `lazy = true`: env + eval move into a shared init, run once from
+/// `lazy = true`: env + eval + run move into a shared init, run once from
 /// whichever trigger fires first (command name, or `bind`'s ZLE widget).
 fn render_lazy_blocks(out: &mut String, config: &Config, lock: &Lock) {
     for entry in config::all_entries(config) {
         let common = entry.common();
-        if !common.lazy || (common.env.is_empty() && common.eval.is_none()) {
+        if !common.lazy || (common.env.is_empty() && common.eval.is_none() && common.run.is_none())
+        {
             continue;
         }
         let key = entry.key();
@@ -168,6 +182,11 @@ fn render_lazy_blocks(out: &mut String, config: &Config, lock: &Lock) {
         }
         if let Some(eval) = &common.eval {
             for line in render_eval_text(eval, tool_lock).lines() {
+                body.push_str(&format!("  {line}\n"));
+            }
+        }
+        if let Some(run) = &common.run {
+            for line in run.lines() {
                 body.push_str(&format!("  {line}\n"));
             }
         }
@@ -222,7 +241,7 @@ fn render_plugins(out: &mut String, config: &Config, layout: &Layout) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{CompletionsSpec, EvalSpec, Host, PluginEntry, RepoEntry};
+    use crate::config::{self, EvalSpec, Host, PluginEntry, RepoEntry, RunSpec};
     use crate::lock::ToolLock;
     use std::collections::HashMap;
     use std::path::Path;
@@ -239,14 +258,8 @@ mod tests {
             bpick: None,
             extract: None,
             common: Common {
-                description: None,
-                bin: None,
-                env: HashMap::new(),
                 eval,
-                completions: CompletionsSpec::Enabled(true),
-                setup: None,
-                lazy: false,
-                bind: None,
+                ..config::test_common()
             },
         }
     }
@@ -263,14 +276,11 @@ mod tests {
             bpick: None,
             extract: None,
             common: Common {
-                description: None,
-                bin: None,
                 env,
                 eval,
-                completions: CompletionsSpec::Enabled(true),
-                setup: None,
                 lazy: true,
                 bind: bind.map(str::to_string),
+                ..config::test_common()
             },
         }
     }
@@ -360,6 +370,58 @@ mod tests {
             r"$HOME/configs/\$secret"
         );
         assert_eq!(expand_tilde_export("~"), "$HOME");
+    }
+
+    #[test]
+    fn eager_run_is_rendered_verbatim_at_top_level() {
+        let mut config = Config::default();
+        config.repo.push(RepoEntry {
+            name: "casey/just".to_string(),
+            host: Host::Github,
+            bpick: None,
+            extract: None,
+            common: Common {
+                run: Some(RunSpec::Single(r#"alias js="just""#.to_string())),
+                ..config::test_common()
+            },
+        });
+
+        let out = render(&config, &Lock::default(), &layout());
+        let lines: Vec<&str> = out.lines().collect();
+
+        assert!(lines.contains(&r#"alias js="just""#));
+    }
+
+    #[test]
+    fn lazy_run_is_deferred_into_the_shared_init_function() {
+        let mut config = Config::default();
+        config.repo.push(RepoEntry {
+            name: "dandavison/delta".to_string(),
+            host: Host::Github,
+            bpick: None,
+            extract: None,
+            common: Common {
+                run: Some(RunSpec::Multiple(vec![
+                    "alias d=delta".to_string(),
+                    "alias dd=\"delta --diff-so-fancy\"".to_string(),
+                ])),
+                lazy: true,
+                ..config::test_common()
+            },
+        });
+
+        let mut lock = Lock::default();
+        lock.tool
+            .insert("delta".to_string(), tool_lock_with_eval(None, None));
+
+        let out = render(&config, &lock, &layout());
+        let lines: Vec<&str> = out.lines().collect();
+
+        // Not rendered before the tool's own init function ran.
+        assert!(!lines.contains(&"alias d=delta"));
+        assert!(lines.contains(&"_rig_lazy_init_delta() {"));
+        assert!(lines.contains(&"  alias d=delta"));
+        assert!(lines.contains(&"  alias dd=\"delta --diff-so-fancy\""));
     }
 
     #[test]
@@ -479,6 +541,16 @@ mod tests {
             Some(EvalSpec::Cmd("atuin init zsh".to_string())),
             Some("^r:_atuin_search_widget"),
         ));
+        config.repo.push(RepoEntry {
+            name: "casey/just".to_string(),
+            host: Host::Github,
+            bpick: None,
+            extract: None,
+            common: Common {
+                run: Some(RunSpec::Single(r#"alias js="just""#.to_string())),
+                ..config::test_common()
+            },
+        });
 
         let mut lock = Lock::default();
         lock.tool.insert(

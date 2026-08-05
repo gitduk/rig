@@ -55,16 +55,36 @@ pub struct Common {
     #[serde(default)]
     pub env: HashMap<String, String>,
     pub eval: Option<EvalSpec>,
+    /// Plain shell text (e.g. `alias js="just"`) run verbatim, never
+    /// captured like `eval`. `lazy` below defers it the same way.
+    pub run: Option<RunSpec>,
     #[serde(default = "default_completions")]
     pub completions: CompletionsSpec,
     pub setup: Option<SetupSpec>,
-    /// Defers `env`/`eval` to first use of the tool's own command name —
-    /// wrong for tools whose hooks must observe events from session start.
+    /// Defers `env`/`eval`/`run` to first use of the tool's own command
+    /// name — wrong for tools whose hooks must observe events from start.
     #[serde(default)]
     pub lazy: bool,
     /// Only meaningful with `lazy`: `"key:widget"` — placeholder ZLE widget
     /// that runs the deferred setup, then rebinds `key` to the real one.
     pub bind: Option<String>,
+}
+
+/// Every `[[source]]` type's tests build a `Common` with mostly-default
+/// fields — shared here so a new field only needs updating once ([TEST-1]).
+#[cfg(test)]
+pub fn test_common() -> Common {
+    Common {
+        description: None,
+        bin: None,
+        env: HashMap::new(),
+        eval: None,
+        run: None,
+        completions: default_completions(),
+        setup: None,
+        lazy: false,
+        bind: None,
+    }
 }
 
 /// Three TOML shapes for one field, resolved via untagged.
@@ -127,6 +147,25 @@ impl EvalSpec {
         match self {
             EvalSpec::Cmd(_) => None,
             EvalSpec::Detailed { cache, .. } => *cache,
+        }
+    }
+}
+
+/// One line, or several — plain shell text for `run`, taken verbatim.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum RunSpec {
+    Single(String),
+    Multiple(Vec<String>),
+}
+
+impl RunSpec {
+    /// `Single` may be a `'''...'''` block of several physical lines —
+    /// split and drop blanks so callers get one statement per entry.
+    pub fn lines(&self) -> Vec<&str> {
+        match self {
+            RunSpec::Single(text) => text.lines().filter(|l| !l.trim().is_empty()).collect(),
+            RunSpec::Multiple(lines) => lines.iter().map(String::as_str).collect(),
         }
     }
 }
@@ -445,5 +484,105 @@ atload = "_zsh_autosuggest_start"
         let cfg = parse("").expect("empty config should parse with defaults");
         assert_eq!(cfg.settings.prefix, "~/.local");
         assert_eq!(cfg.settings.parallel, 8);
+    }
+
+    #[test]
+    fn run_field_parses_single_and_multiple_forms() {
+        let cfg = parse(
+            r#"
+[[curl]]
+name = "casey/just"
+url = "https://just.systems/install.sh"
+run = 'alias js="just"'
+
+[[curl]]
+name = "foo/bar"
+url = "https://example.com/install.sh"
+run = ["alias a=\"b\"", "alias c=\"d\""]
+"#,
+        )
+        .expect("should parse both run shapes");
+
+        assert_eq!(
+            cfg.curl[0].common.run.as_ref().unwrap().lines(),
+            vec![r#"alias js="just""#]
+        );
+        assert_eq!(
+            cfg.curl[1].common.run.as_ref().unwrap().lines(),
+            vec![r#"alias a="b""#, r#"alias c="d""#]
+        );
+    }
+
+    #[test]
+    fn run_field_parses_a_triple_quoted_block_into_separate_lines() {
+        let cfg = parse(
+            "
+[[curl]]
+name = \"casey/just\"
+url = \"https://just.systems/install.sh\"
+run = '''
+alias a=\"b\"
+
+alias c=\"d\"
+'''
+",
+        )
+        .expect("should parse a triple-quoted run block");
+
+        assert_eq!(
+            cfg.curl[0].common.run.as_ref().unwrap().lines(),
+            vec![r#"alias a="b""#, r#"alias c="d""#]
+        );
+    }
+
+    #[test]
+    fn run_field_accepts_all_three_empty_shapes() {
+        let cfg = parse(
+            r#"
+[[curl]]
+name = "a/a"
+url = "https://example.com"
+run = ""
+
+[[curl]]
+name = "b/b"
+url = "https://example.com"
+run = []
+
+[[curl]]
+name = "c/c"
+url = "https://example.com"
+run = ''''''
+"#,
+        )
+        .expect("all three empty run shapes should parse");
+
+        for entry in &cfg.curl {
+            assert_eq!(
+                entry.common.run.as_ref().unwrap().lines(),
+                Vec::<&str>::new()
+            );
+        }
+    }
+
+    #[test]
+    fn run_field_parses_a_basic_multiline_block_with_escapes() {
+        let cfg = parse(
+            "
+[[curl]]
+name = \"casey/just\"
+url = \"https://just.systems/install.sh\"
+run = \"\"\"
+alias js=\\\"just\\\"
+alias jl=\\\"just --list\\\"
+\"\"\"
+",
+        )
+        .expect("should parse a basic (double-quoted) multiline run block");
+
+        assert_eq!(
+            cfg.curl[0].common.run.as_ref().unwrap().lines(),
+            vec![r#"alias js="just""#, r#"alias jl="just --list""#]
+        );
     }
 }

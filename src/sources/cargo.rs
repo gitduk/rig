@@ -99,21 +99,15 @@ pub fn install(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Common, CompletionsSpec};
-    use std::collections::HashMap;
+    use crate::config::{self, Common, CompletionsSpec};
 
     fn ripgrep_entry() -> CargoEntry {
         CargoEntry {
             name: "ripgrep".to_string(),
             common: Common {
-                description: None,
                 bin: Some(crate::config::BinSpec::Single("rg".to_string())),
-                env: HashMap::new(),
-                eval: None,
                 completions: CompletionsSpec::Enabled(false),
-                setup: None,
-                lazy: false,
-                bind: None,
+                ..config::test_common()
             },
         }
     }

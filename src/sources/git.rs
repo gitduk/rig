@@ -144,7 +144,7 @@ pub fn install(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BinSpec, Common, CompletionsSpec};
+    use crate::config::{self, BinSpec, Common, CompletionsSpec};
 
     #[test]
     fn clone_url_dispatches_by_host() {
@@ -170,14 +170,9 @@ mod tests {
             name: "octocat/Hello-World".to_string(),
             host: Host::Github,
             common: Common {
-                description: None,
                 bin: Some(BinSpec::Single("README".to_string())),
-                env: std::collections::HashMap::new(),
-                eval: None,
                 completions: CompletionsSpec::Enabled(false),
-                setup: None,
-                lazy: false,
-                bind: None,
+                ..config::test_common()
             },
         };
 

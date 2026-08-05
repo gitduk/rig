@@ -843,16 +843,11 @@ mod tests {
         fs::set_permissions(&bin_path, perms).expect("chmod +x");
 
         let common = Common {
-            description: None,
             bin: Some(BinSpec::Single("uv".to_string())),
-            env: HashMap::new(),
-            eval: None,
             completions: CompletionsSpec::Generate {
                 generate: "./uv --dummy".to_string(),
             },
-            setup: None,
-            lazy: false,
-            bind: None,
+            ..crate::config::test_common()
         };
         let lock = Lock::default();
         let artifacts = collect_artifacts(
@@ -899,14 +894,8 @@ mod tests {
         let new_final_dir = tmp.path().join("pkg/delta/0.19.0");
 
         let common = Common {
-            description: None,
-            bin: None,
-            env: HashMap::new(),
-            eval: None,
             completions: CompletionsSpec::Enabled(false),
-            setup: None,
-            lazy: false,
-            bind: None,
+            ..crate::config::test_common()
         };
         let result = collect_artifacts(
             &partial_dir,

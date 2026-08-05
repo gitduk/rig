@@ -547,14 +547,7 @@ mod tests {
             bpick: None,
             extract: None,
             common: crate::config::Common {
-                description: None,
-                bin: None,
-                env: std::collections::HashMap::new(),
-                eval: None,
-                completions: CompletionsSpec::Enabled(true),
-                setup: None,
-                lazy: false,
-                bind: None,
+                ..config::test_common()
             },
         });
 
