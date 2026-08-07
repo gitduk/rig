@@ -3,8 +3,10 @@
 //! resolved the same way as `[[apt]]` — via PATH, after the script has done
 //! whatever placement it does on its own.
 
+use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, bail};
@@ -39,8 +41,12 @@ pub fn install(entry: &CurlEntry, layout: &Layout, phase: Phase) -> anyhow::Resu
     fs::set_permissions(&script_path, perms)
         .with_context(|| format!("failed to chmod +x {}", script_path.display()))?;
 
+    fs::create_dir_all(&layout.prefix_bin_dir)
+        .with_context(|| format!("failed to create {}", layout.prefix_bin_dir.display()))?;
+
     let mut command = Command::new(&script_path);
     command.current_dir(&work_dir);
+    command.env("PATH", pinned_path(&layout.prefix_bin_dir));
     apply_env(&mut command, &entry.common.env)?;
     let status = command
         .status()
@@ -57,6 +63,7 @@ pub fn install(entry: &CurlEntry, layout: &Layout, phase: Phase) -> anyhow::Resu
     let bins = resolve_declared_bins(
         entry.common.bin.as_ref(),
         tool,
+        Some(&layout.prefix_bin_dir),
         &format!("running {tool}'s install script"),
     )?;
     let completions = collect_completions(
@@ -91,6 +98,17 @@ pub fn install(entry: &CurlEntry, layout: &Layout, phase: Phase) -> anyhow::Resu
     })
 }
 
+/// Prepends `prefix_bin_dir` so installers that scan `$PATH` for the first
+/// writable directory land there, not on some other writable PATH entry.
+fn pinned_path(prefix_bin_dir: &Path) -> OsString {
+    let mut path = OsString::from(prefix_bin_dir);
+    if let Some(existing) = std::env::var_os("PATH") {
+        path.push(":");
+        path.push(existing);
+    }
+    path
+}
+
 fn fetch_script(url: &str) -> anyhow::Result<String> {
     ureq::get(url)
         .header("User-Agent", USER_AGENT)
@@ -99,4 +117,23 @@ fn fetch_script(url: &str) -> anyhow::Result<String> {
         .body_mut()
         .read_to_string()
         .with_context(|| format!("failed to read script body from {url}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pinned_path_prepends_prefix_bin_dir() {
+        // Recomputed, not hardcoded — must hold even where PATH is unset.
+        let expected_suffix = std::env::var_os("PATH")
+            .map(|p| format!(":{}", p.to_string_lossy()))
+            .unwrap_or_default();
+
+        let result = pinned_path(Path::new("/opt/tools/bin"));
+        assert_eq!(
+            result.to_string_lossy(),
+            format!("/opt/tools/bin{expected_suffix}")
+        );
+    }
 }

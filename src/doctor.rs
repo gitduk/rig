@@ -218,12 +218,15 @@ fn check_dangling_symlinks(layout: &Layout) -> Vec<Finding> {
 fn check_foreign_prefix_bin(config: &Config, lock: &Lock, layout: &Layout) -> Vec<Finding> {
     let mut findings = Vec::new();
     for entry in config::all_entries(config) {
+        let Some(common) = entry.common() else {
+            continue;
+        };
         let key = entry.key();
         if lock.tool.contains_key(&key) {
             continue;
         }
         let default = config::tool_key(entry.name());
-        for name in config::BinSpec::declared_names(entry.common().bin.as_ref(), default) {
+        for name in config::BinSpec::declared_names(common.bin.as_ref(), default) {
             let candidate = layout.prefix_bin_dir.join(&name);
             if candidate.exists() || candidate.is_symlink() {
                 findings.push(warn(format!(
@@ -240,12 +243,14 @@ fn check_foreign_prefix_bin(config: &Config, lock: &Lock, layout: &Layout) -> Ve
 fn check_missing_completions(config: &Config, lock: &Lock) -> Vec<Finding> {
     let mut findings = Vec::new();
     for entry in config::all_entries(config) {
+        let Some(common) = entry.common() else {
+            continue;
+        };
         let key = entry.key();
         let Some(tool) = lock.tool.get(&key) else {
             continue;
         };
-        let wants_completions =
-            !matches!(entry.common().completions, CompletionsSpec::Enabled(false));
+        let wants_completions = !matches!(common.completions, CompletionsSpec::Enabled(false));
         if wants_completions && tool.completions.is_empty() {
             findings.push(warn(format!(
                 "{key} is installed but has no registered completions"
@@ -305,7 +310,7 @@ fn collect_filenames(dir: &Path, names: &mut HashSet<String>) {
 fn check_sudo_in_setup(config: &Config) -> Vec<Finding> {
     let mut findings = Vec::new();
     for entry in config::all_entries(config) {
-        let Some(setup) = &entry.common().setup else {
+        let Some(setup) = entry.common().and_then(|c| c.setup.as_ref()) else {
             continue;
         };
         if setup_uses_sudo(setup) {
@@ -386,7 +391,7 @@ fn check_eval_cache_drift(config: &Config, lock: &Lock) -> Vec<Finding> {
     let mut findings = Vec::new();
     for entry in config::all_entries(config) {
         let key = entry.key();
-        let Some(eval) = &entry.common().eval else {
+        let Some(eval) = entry.common().and_then(|c| c.eval.as_ref()) else {
             continue;
         };
         if eval.cache_override().is_some() {
@@ -404,7 +409,7 @@ fn check_eval_cache_drift(config: &Config, lock: &Lock) -> Vec<Finding> {
         {
             findings.push(warn(format!(
                 "{key}'s eval cacheability changed ({recorded} -> {}) \
-                 — run `rig update {key}` to re-probe",
+                 — run `rig sync --force` to re-probe",
                 probe.cacheable
             )));
         }
@@ -415,27 +420,8 @@ fn check_eval_cache_drift(config: &Config, lock: &Lock) -> Vec<Finding> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lock::ToolLock;
+    use crate::lock;
     use std::os::unix::fs::symlink;
-    use time::OffsetDateTime;
-
-    fn tool_lock() -> ToolLock {
-        ToolLock {
-            version: "1.0.0".to_string(),
-            source: "github:test/test".to_string(),
-            installed_at: OffsetDateTime::UNIX_EPOCH,
-            bins: Vec::new(),
-            completions: Vec::new(),
-            asset: None,
-            size: None,
-            pkg: None,
-            manager: None,
-            root: None,
-            eval_cacheable: None,
-            eval_cached_output: None,
-            eval_evidence: Vec::new(),
-        }
-    }
 
     #[test]
     fn flags_prefix_bin_dir_missing_from_path() {
@@ -461,7 +447,7 @@ mod tests {
         fs::write(system_dir.join("uv"), b"system copy").expect("write shadowing bin");
 
         let mut lock = Lock::default();
-        let mut tool = tool_lock();
+        let mut tool = lock::test_tool_lock();
         tool.bins = vec![layout.prefix_bin_dir.join("uv").display().to_string()];
         lock.tool.insert("uv".to_string(), tool);
 
@@ -485,7 +471,7 @@ mod tests {
     #[test]
     fn flags_lock_entry_whose_pkg_dir_vanished() {
         let mut lock = Lock::default();
-        let mut tool = tool_lock();
+        let mut tool = lock::test_tool_lock();
         tool.pkg = Some("/nonexistent/pkg/dir".to_string());
         lock.tool.insert("ghost".to_string(), tool);
 
@@ -507,7 +493,7 @@ mod tests {
         fs::create_dir_all(&orphan).expect("mkdir orphan");
 
         let mut lock = Lock::default();
-        let mut tool = tool_lock();
+        let mut tool = lock::test_tool_lock();
         tool.pkg = Some(tracked.display().to_string());
         lock.tool.insert("delta".to_string(), tool);
 
@@ -572,11 +558,11 @@ mod tests {
     #[test]
     fn flags_compdef_without_a_guard() {
         let mut lock = Lock::default();
-        let mut unguarded = tool_lock();
+        let mut unguarded = lock::test_tool_lock();
         unguarded.eval_cached_output = Some("compdef _foo foo".to_string());
         lock.tool.insert("foo".to_string(), unguarded);
 
-        let mut guarded = tool_lock();
+        let mut guarded = lock::test_tool_lock();
         guarded.eval_cached_output =
             Some("[[ ${+functions[compdef]} -ne 0 ]] && compdef _bar bar".to_string());
         lock.tool.insert("bar".to_string(), guarded);

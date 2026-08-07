@@ -32,6 +32,24 @@ const USER_AGENT: &str = concat!("rig/", env!("CARGO_PKG_VERSION"));
 /// mechanism exists, so error messages can name it as a literal.
 const CONFIG_PATH_HINT: &str = "~/.config/rig/config.toml";
 
+/// Shared by `git.rs` (post-clone, before symlinking) and `plugin.rs`
+/// (post-clone/pull, as the plugin's own version marker).
+pub fn git_head_commit(repo_dir: &Path) -> anyhow::Result<String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo_dir)
+        .output()
+        .context("failed to run `git rev-parse HEAD`")?;
+    if !output.status.success() {
+        bail!(
+            "git rev-parse HEAD failed in {}: {}",
+            repo_dir.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 /// Applies configured `env` to an install subprocess — never inherit-only,
 /// or install location depends on the caller's shell.
 pub fn apply_env(cmd: &mut Command, env: &HashMap<String, String>) -> anyhow::Result<()> {
@@ -61,18 +79,37 @@ pub fn resolve_on_path(name: &str) -> anyhow::Result<String> {
 
 /// Resolves every declared command name via PATH — `[[apt]]`/`[[curl]]`'s
 /// equivalent of `collect_bins` for source types rig doesn't symlink into.
+/// `preferred_dir` (checked before PATH) is `[[curl]]`'s pinned install dir;
+/// `[[apt]]` passes `None` since dpkg places files itself.
 pub fn resolve_declared_bins(
     bin: Option<&BinSpec>,
     tool: &str,
+    preferred_dir: Option<&Path>,
     context: &str,
 ) -> anyhow::Result<Vec<String>> {
     BinSpec::declared_names(bin, tool)
         .iter()
-        .map(|name| {
-            resolve_on_path(name)
-                .with_context(|| format!("{name} not found on PATH after {context}"))
-        })
+        .map(|name| resolve_bin_name(name, preferred_dir, context))
         .collect()
+}
+
+fn resolve_bin_name(
+    name: &str,
+    preferred_dir: Option<&Path>,
+    context: &str,
+) -> anyhow::Result<String> {
+    if let Some(dir) = preferred_dir {
+        let managed = dir.join(name);
+        if managed.exists() {
+            return Ok(managed.display().to_string());
+        }
+        eprintln!(
+            "warning: {name} landed outside {} after {context} — \
+             recording its ambient PATH location instead",
+            dir.display()
+        );
+    }
+    resolve_on_path(name).with_context(|| format!("{name} not found on PATH after {context}"))
 }
 
 /// Shared by every "picked 0 or N>1 out of a known set" error, so they all
@@ -402,6 +439,27 @@ fn rebase(path: &Path, from: &Path, to: &Path) -> PathBuf {
     }
 }
 
+/// Runs `<bin> --version` against a freshly extracted, not-yet-live build.
+/// `repo::install` calls this only for rig's own entry, before the symlink swap.
+pub fn smoke_test_version(
+    search_dir: &Path,
+    bin_spec: Option<&BinSpec>,
+    default_name: &str,
+) -> anyhow::Result<()> {
+    let (name, path) = resolve_bin_sources(search_dir, bin_spec, default_name)?
+        .into_iter()
+        .next()
+        .context("no bin resolved to smoke-test")?;
+    let status = Command::new(&path)
+        .arg("--version")
+        .status()
+        .with_context(|| format!("failed to run `{name} --version`"))?;
+    if !status.success() {
+        bail!("`{name} --version` exited with {status} — refusing to make this build live");
+    }
+    Ok(())
+}
+
 /// `collect_bins`'s resolution step, exposed so callers can find where the
 /// bin landed without duplicating the `BinSpec` match.
 fn resolve_bin_sources(
@@ -712,6 +770,60 @@ mod tests {
         assert_eq!(stdout.trim(), format!("hello:{}/.local", home.display()));
     }
 
+    fn write_fake_bin(dir: &Path, name: &str, script: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = dir.join(name);
+        fs::write(&path, script).expect("write fake bin");
+        let mut perms = fs::metadata(&path).expect("stat fake bin").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms).expect("chmod +x fake bin");
+    }
+
+    #[test]
+    fn smoke_test_version_passes_a_working_build() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_fake_bin(tmp.path(), "rig", "#!/bin/sh\nexit 0\n");
+
+        smoke_test_version(tmp.path(), None, "rig").expect("`--version` exiting 0 should pass");
+    }
+
+    #[test]
+    fn smoke_test_version_rejects_a_broken_build() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_fake_bin(tmp.path(), "rig", "#!/bin/sh\nexit 1\n");
+
+        let err = smoke_test_version(tmp.path(), None, "rig")
+            .expect_err("`--version` exiting non-zero must fail the smoke test");
+        assert!(err.to_string().contains("--version"));
+    }
+
+    #[test]
+    fn resolve_bin_name_prefers_the_preferred_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let preferred_dir = tmp.path().join("bin");
+        fs::create_dir_all(&preferred_dir).expect("mkdir preferred_dir");
+        fs::write(preferred_dir.join("witr"), b"binary").expect("write fake binary");
+
+        let resolved = resolve_bin_name("witr", Some(&preferred_dir), "test")
+            .expect("preferred-dir bin should resolve without touching PATH");
+
+        assert_eq!(resolved, preferred_dir.join("witr").display().to_string());
+    }
+
+    #[test]
+    fn resolve_bin_name_falls_back_to_ambient_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let preferred_dir = tmp.path().join("bin");
+        // Never created — nothing landed there, e.g. a script with its own
+        // install-location convention (`zb`'s `ZEROBREW_PREFIX`).
+
+        let resolved = resolve_bin_name("sh", Some(&preferred_dir), "test")
+            .expect("`sh` should resolve via ambient PATH");
+
+        assert!(resolved.ends_with("/sh"));
+    }
+
     #[test]
     fn extract_false_marks_the_copied_binary_executable() {
         use std::os::unix::fs::PermissionsExt;
@@ -885,7 +997,10 @@ mod tests {
         let mut lock = Lock::default();
         lock.tool.insert(
             "delta".to_string(),
-            test_tool_lock(vec![bin_link.display().to_string()]),
+            crate::lock::ToolLock {
+                bins: vec![bin_link.display().to_string()],
+                ..crate::lock::test_tool_lock()
+            },
         );
 
         // New version's `.partial` is missing the expected binary entirely.
@@ -922,23 +1037,5 @@ mod tests {
             !new_final_dir.exists(),
             "finalize_partial must never have run"
         );
-    }
-
-    fn test_tool_lock(bins: Vec<String>) -> crate::lock::ToolLock {
-        crate::lock::ToolLock {
-            version: "0.18.2".to_string(),
-            source: "github:dandavison/delta".to_string(),
-            installed_at: time::OffsetDateTime::UNIX_EPOCH,
-            bins,
-            completions: Vec::new(),
-            asset: None,
-            size: None,
-            pkg: None,
-            manager: None,
-            root: None,
-            eval_cacheable: None,
-            eval_cached_output: None,
-            eval_evidence: Vec::new(),
-        }
     }
 }

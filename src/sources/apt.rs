@@ -48,6 +48,7 @@ pub fn install(entry: &AptEntry, layout: &Layout, phase: Phase) -> anyhow::Resul
     let bins = resolve_declared_bins(
         entry.common.bin.as_ref(),
         tool,
+        None,
         &format!("installing {}", entry.name),
     )?;
     let completions = collect_completions(

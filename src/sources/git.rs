@@ -13,7 +13,9 @@ use crate::config::{GitEntry, Host};
 use crate::lock::{Lock, ToolLock};
 use crate::paths::Layout;
 
-use super::{Phase, apply_env, collect_artifacts, finalize_partial, run_setup, tool_key};
+use super::{
+    Phase, apply_env, collect_artifacts, finalize_partial, git_head_commit, run_setup, tool_key,
+};
 
 fn clone_url(host: Host, name: &str) -> String {
     match host {
@@ -53,22 +55,6 @@ fn git_clone(url: &str, dest: &Path, env: &HashMap<String, String>) -> anyhow::R
         bail!("git clone {url} failed ({status})");
     }
     Ok(())
-}
-
-fn git_head_commit(repo_dir: &Path) -> anyhow::Result<String> {
-    let output = Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(repo_dir)
-        .output()
-        .context("failed to run `git rev-parse HEAD`")?;
-    if !output.status.success() {
-        bail!(
-            "git rev-parse HEAD failed in {}: {}",
-            repo_dir.display(),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 /// The hook only builds (e.g. `cargo build`), never installs — rig

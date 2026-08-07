@@ -277,9 +277,12 @@ pub struct CurlEntry {
 }
 
 /// `[[plugin]]`: Job B, zsh loads it. Rig only clones/updates.
+/// No `Common` here — `bin`/`eval`/`setup`/`lazy`/`bind` describe an
+/// installed *command*, and a plugin is never invoked by name.
 #[derive(Debug, Deserialize)]
 pub struct PluginEntry {
     pub name: String,
+    pub description: Option<String>,
     pub source: Option<String>,
     /// Parsed but not acted on — a defer mechanism wasn't worth building,
     /// so `initzsh.rs` sources plugins in config order instead.
@@ -295,7 +298,7 @@ pub fn tool_key(name: &str) -> &str {
     name.rsplit('/').next().unwrap_or(name)
 }
 
-/// One entry from any of the six `[[source]]` vectors, for code that needs
+/// One entry from any of the seven `[[source]]` vectors, for code that needs
 /// to work across all of them (CLI dispatch, `rig list`, init.zsh gen).
 pub enum ResolvedEntry<'a> {
     Repo(&'a RepoEntry),
@@ -304,6 +307,7 @@ pub enum ResolvedEntry<'a> {
     Node(&'a NodeEntry),
     Apt(&'a AptEntry),
     Curl(&'a CurlEntry),
+    Plugin(&'a PluginEntry),
 }
 
 impl<'a> ResolvedEntry<'a> {
@@ -315,17 +319,28 @@ impl<'a> ResolvedEntry<'a> {
             Self::Node(e) => &e.name,
             Self::Apt(e) => &e.name,
             Self::Curl(e) => &e.name,
+            Self::Plugin(e) => &e.name,
         }
     }
 
-    pub fn common(&self) -> &'a Common {
+    /// `None` for `Plugin` — it has no `Common`, and a missing `bin` there
+    /// doesn't mean "named after the tool" the way it does for the other six.
+    pub fn common(&self) -> Option<&'a Common> {
         match self {
-            Self::Repo(e) => &e.common,
-            Self::Git(e) => &e.common,
-            Self::Cargo(e) => &e.common,
-            Self::Node(e) => &e.common,
-            Self::Apt(e) => &e.common,
-            Self::Curl(e) => &e.common,
+            Self::Repo(e) => Some(&e.common),
+            Self::Git(e) => Some(&e.common),
+            Self::Cargo(e) => Some(&e.common),
+            Self::Node(e) => Some(&e.common),
+            Self::Apt(e) => Some(&e.common),
+            Self::Curl(e) => Some(&e.common),
+            Self::Plugin(_) => None,
+        }
+    }
+
+    pub fn description(&self) -> Option<&'a str> {
+        match self {
+            Self::Plugin(e) => e.description.as_deref(),
+            other => other.common().and_then(|c| c.description.as_deref()),
         }
     }
 
@@ -347,6 +362,7 @@ pub fn all_entries(config: &Config) -> Vec<ResolvedEntry<'_>> {
     entries.extend(config.node.iter().map(ResolvedEntry::Node));
     entries.extend(config.apt.iter().map(ResolvedEntry::Apt));
     entries.extend(config.curl.iter().map(ResolvedEntry::Curl));
+    entries.extend(config.plugin.iter().map(ResolvedEntry::Plugin));
     entries
 }
 

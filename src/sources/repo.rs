@@ -1,6 +1,7 @@
 //! `[[repo]]` install flow — GitHub/Codeberg release binaries.
 
 use std::fs;
+use std::path::Path;
 
 use anyhow::{Context, anyhow, bail};
 use time::OffsetDateTime;
@@ -84,6 +85,15 @@ pub fn install(
             .with_context(|| format!("setup hook failed for {tool}"))?;
     }
 
+    // Only for rig's own entry (by binary identity, not by repo owner, so
+    // forks still match) — a broken release must never go live unverified.
+    if tool == env!("CARGO_PKG_NAME") {
+        super::smoke_test_version(&partial_dir, entry.common.bin.as_ref(), tool)
+            .with_context(|| "new build failed its smoke test — keeping the current rig live")?;
+
+        adopt_bootstrap_binary(&layout.prefix_bin_dir.join(tool))?;
+    }
+
     // Collect (and thus conflict-check) *before* the atomic rename — a
     // failure here must never have already destroyed the old version.
     let artifacts = collect_artifacts(
@@ -125,6 +135,16 @@ pub fn install(
         eval_cached_output,
         eval_evidence,
     })
+}
+
+/// Adopt a raw binary left by the bootstrap snippet; a real symlink here
+/// means rig already owns it — leave that to `check_conflict`.
+fn adopt_bootstrap_binary(live: &Path) -> anyhow::Result<()> {
+    if live.exists() && !live.is_symlink() {
+        fs::remove_file(live)
+            .with_context(|| format!("failed to remove the pre-managed {}", live.display()))?;
+    }
+    Ok(())
 }
 
 /// Builds the config-diff body for a failed asset pick — the one place
@@ -188,6 +208,38 @@ mod tests {
     fn tool_key_takes_the_last_path_segment() {
         assert_eq!(tool_key("dandavison/delta"), "delta");
         assert_eq!(tool_key("delta"), "delta");
+    }
+
+    #[test]
+    fn adopt_bootstrap_binary_removes_a_plain_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let live = tmp.path().join("rig");
+        fs::write(&live, b"bootstrap binary").expect("write fake bootstrap binary");
+
+        adopt_bootstrap_binary(&live).expect("plain file should be adopted");
+
+        assert!(!live.exists());
+    }
+
+    #[test]
+    fn adopt_bootstrap_binary_leaves_an_existing_symlink_alone() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let target = tmp.path().join("real-rig");
+        fs::write(&target, b"managed binary").expect("write managed binary");
+        let live = tmp.path().join("rig");
+        std::os::unix::fs::symlink(&target, &live).expect("symlink managed binary");
+
+        adopt_bootstrap_binary(&live).expect("an existing symlink must be a no-op");
+
+        assert!(live.is_symlink());
+    }
+
+    #[test]
+    fn adopt_bootstrap_binary_is_a_noop_when_nothing_is_there() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let live = tmp.path().join("rig");
+
+        adopt_bootstrap_binary(&live).expect("a missing path must be a no-op");
     }
 
     fn delta_entry() -> RepoEntry {

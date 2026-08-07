@@ -38,7 +38,11 @@ enum Command {
     /// List configured tools and whether they're installed
     List,
     /// Regenerate init.zsh from the current config
-    Sync,
+    Sync {
+        /// Re-probe every tool's `eval` cacheability in place
+        #[arg(long)]
+        force: bool,
+    },
     /// Run diagnostic checks
     Doctor,
     /// Resolve a command name to the tool that provides it
@@ -98,7 +102,7 @@ fn dispatch(command: Command) -> anyhow::Result<ExitCode> {
         Command::Update { tools, force } => cmd_update(tools, force),
         Command::Remove { tools } => cmd_remove(tools),
         Command::List => cmd_list().map(|()| ExitCode::SUCCESS),
-        Command::Sync => cmd_sync(),
+        Command::Sync { force } => cmd_sync(force),
         Command::Doctor => cmd_doctor().map(|()| ExitCode::SUCCESS),
         Command::Which { command } => cmd_which(command).map(|()| ExitCode::SUCCESS),
         Command::Completions { shell } => {
@@ -144,7 +148,7 @@ fn cmd_install(tools: Vec<String>) -> anyhow::Result<ExitCode> {
     // not lose lock state for tools that already finished installing.
     let mut failed = false;
     for name in &tools {
-        match install_one(&mut ctx, name).and_then(|()| ctx.save()) {
+        match install_entry(&mut ctx, name).and_then(|()| ctx.save()) {
             Ok(()) => {}
             Err(e) => {
                 failed = true;
@@ -160,7 +164,7 @@ fn cmd_install(tools: Vec<String>) -> anyhow::Result<ExitCode> {
     })
 }
 
-fn install_one(ctx: &mut Ctx, requested: &str) -> anyhow::Result<()> {
+fn install_entry(ctx: &mut Ctx, requested: &str) -> anyhow::Result<()> {
     let resolved = config::resolve_tool(&ctx.config, requested)
         .ok_or_else(|| anyhow!("{requested} is not in config.toml"))?;
     let key = resolved.key();
@@ -168,11 +172,20 @@ fn install_one(ctx: &mut Ctx, requested: &str) -> anyhow::Result<()> {
     // Skip only if genuinely healthy — a dangling bin must still fall
     // through, since `command_not_found_handler` relies on this to self-heal.
     if let Some(existing) = ctx.lock.tool.get(&key) {
-        let healthy = !existing.bins.is_empty()
-            && existing
-                .bins
-                .iter()
-                .all(|b| std::path::Path::new(b).exists());
+        let healthy = match resolved {
+            // A plugin has no bins — "healthy" means its clone still exists.
+            ResolvedEntry::Plugin(_) => existing
+                .pkg
+                .as_deref()
+                .is_some_and(|p| std::path::Path::new(p).exists()),
+            _ => {
+                !existing.bins.is_empty()
+                    && existing
+                        .bins
+                        .iter()
+                        .all(|b| std::path::Path::new(b).exists())
+            }
+        };
         if healthy {
             println!(
                 "{key} is already installed ({}) — use `rig update {key}` to check \
@@ -198,6 +211,7 @@ fn install_one(ctx: &mut Ctx, requested: &str) -> anyhow::Result<()> {
         }
         ResolvedEntry::Apt(e) => sources::apt::install(e, &ctx.layout, sources::Phase::Install)?,
         ResolvedEntry::Curl(e) => sources::curl::install(e, &ctx.layout, sources::Phase::Install)?,
+        ResolvedEntry::Plugin(e) => sources::plugin::install(e, &ctx.layout)?,
     };
     println!("installed {key} {}", new_lock.version);
     ctx.lock.tool.insert(key, new_lock);
@@ -207,10 +221,27 @@ fn install_one(ctx: &mut Ctx, requested: &str) -> anyhow::Result<()> {
 fn cmd_update(tools: Vec<String>, force: bool) -> anyhow::Result<ExitCode> {
     let mut ctx = Ctx::load()?;
     let filter = (!tools.is_empty()).then_some(tools.as_slice());
-    let reports = update::update_all(&ctx.config, &mut ctx.lock, &ctx.layout, force, filter);
+    let reports = update::update_all(
+        &ctx.config,
+        &mut ctx.lock,
+        &ctx.layout,
+        force,
+        false,
+        filter,
+    );
 
+    Ok(if print_reports(&reports) {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+/// Shared by `cmd_update` and `cmd_sync --force`. Returns whether any
+/// report failed.
+fn print_reports(reports: &[update::Report]) -> bool {
     let mut failed = false;
-    for report in &reports {
+    for report in reports {
         match &report.outcome {
             Ok(outcome) => println!("{}: {}", report.tool, describe_outcome(outcome)),
             Err(e) => {
@@ -219,30 +250,7 @@ fn cmd_update(tools: Vec<String>, force: bool) -> anyhow::Result<ExitCode> {
             }
         }
     }
-
-    // Plugins have no `ResolvedEntry`/key, so a specific `rig update <tool>`
-    // can never mean "and this plugin too" — only a bare `rig update` does.
-    if filter.is_none() {
-        for plugin in &ctx.config.plugin {
-            let dest = ctx.layout.plugins_dir.join(config::tool_key(&plugin.name));
-            if !dest.exists() {
-                continue; // not cloned yet — `rig sync` handles that, not update
-            }
-            match sources::plugin::update(plugin, &ctx.layout) {
-                Ok(()) => println!("{}: pulled", plugin.name),
-                Err(e) => {
-                    failed = true;
-                    print_error(Some(&plugin.name), &e);
-                }
-            }
-        }
-    }
-
-    Ok(if failed {
-        ExitCode::FAILURE
-    } else {
-        ExitCode::SUCCESS
-    })
+    failed
 }
 
 fn describe_outcome(outcome: &update::Outcome) -> String {
@@ -250,6 +258,15 @@ fn describe_outcome(outcome: &update::Outcome) -> String {
         update::Outcome::UpToDate { version } => format!("up to date ({version})"),
         update::Outcome::Updated { from, to } => format!("updated {from} -> {to}"),
         update::Outcome::Reran => "rerun".to_string(),
+        update::Outcome::EvalRefreshed { cacheable } => {
+            let label = match cacheable {
+                Some(true) => "cacheable",
+                Some(false) => "not cacheable, stays live",
+                None => "probe failed, stays live",
+            };
+            format!("eval refreshed ({label})")
+        }
+        update::Outcome::NoEval => "no eval configured, nothing to refresh".to_string(),
     }
 }
 
@@ -303,7 +320,7 @@ fn cmd_list() -> anyhow::Result<()> {
         } else {
             "\u{25cb}"
         };
-        match &entry.common().description {
+        match entry.description() {
             Some(desc) => println!("{marker} {key:width$}  {desc}"),
             None => println!("{marker} {key}"),
         }
@@ -312,29 +329,59 @@ fn cmd_list() -> anyhow::Result<()> {
 }
 
 /// Plugins aren't installed on demand like binaries — `sync` clones any
-/// that are missing so their `source` line in init.zsh resolves.
-fn cmd_sync() -> anyhow::Result<ExitCode> {
-    let ctx = Ctx::load()?;
+/// that are missing so their `source` line in init.zsh resolves. `--force`
+/// additionally re-probes every tool's `eval` cacheability in place.
+fn cmd_sync(force: bool) -> anyhow::Result<ExitCode> {
+    let mut ctx = Ctx::load()?;
+
+    let mut failed = false;
+    if force {
+        let reports =
+            update::update_all(&ctx.config, &mut ctx.lock, &ctx.layout, false, true, None);
+        failed |= print_reports(&reports);
+    }
 
     let old_keys = fs::read_to_string(&ctx.layout.init_zsh_path)
         .map(|content| initzsh::declared_tool_keys(&content))
         .unwrap_or_default();
 
-    let mut failed = false;
-    for plugin in &ctx.config.plugin {
-        let dest = ctx.layout.plugins_dir.join(config::tool_key(&plugin.name));
+    let mut missing = Vec::new();
+    // Indexed: the backfill branch below needs `&mut ctx` to save, which a
+    // live borrow from `for plugin in &ctx.config.plugin` would rule out.
+    for i in 0..ctx.config.plugin.len() {
+        let key = config::tool_key(&ctx.config.plugin[i].name).to_string();
+        let dest = ctx.layout.plugins_dir.join(&key);
         if dest.exists() {
+            // Backfill clones that predate plugin tracking in `rig.lock`,
+            // saved right after — same reason as `cmd_install`'s per-tool save.
+            if !ctx.lock.tool.contains_key(&key) {
+                let backfilled =
+                    sources::plugin::read_installed(&ctx.config.plugin[i], &ctx.layout);
+                let name = ctx.config.plugin[i].name.clone();
+                let result = backfilled.and_then(|tool_lock| {
+                    ctx.lock.tool.insert(key, tool_lock);
+                    ctx.save()
+                });
+                if let Err(e) = result {
+                    failed = true;
+                    print_error(Some(&name), &e);
+                }
+            }
             continue;
         }
-        match sources::plugin::install(plugin, &ctx.layout) {
-            Ok(()) => println!("cloned plugin {}", plugin.name),
-            Err(e) => {
-                failed = true;
-                print_error(Some(&plugin.name), &e);
-            }
+        missing.push(ctx.config.plugin[i].name.clone());
+    }
+    // Goes through the same path as `rig install` — a plugin's `sync`-time
+    // clone shouldn't skip whatever `install_entry` does around it.
+    for name in &missing {
+        if let Err(e) = install_entry(&mut ctx, name).and_then(|()| ctx.save()) {
+            failed = true;
+            print_error(Some(name), &e);
         }
     }
 
+    // Unconditional: `sync`'s job is to regenerate init.zsh from the
+    // current config even when no plugin needed cloning or backfilling.
     ctx.save()?;
     write_own_completions(&ctx.layout)?;
     report_tool_set_diff(&old_keys, &ctx.config);
@@ -418,9 +465,13 @@ fn cmd_doctor() -> anyhow::Result<()> {
 fn cmd_which(command: String) -> anyhow::Result<()> {
     let ctx = Ctx::load()?;
     for entry in config::all_entries(&ctx.config) {
+        // A plugin is sourced, never invoked by command name.
+        let Some(common) = entry.common() else {
+            continue;
+        };
         let key = entry.key();
         let default = config::tool_key(entry.name());
-        let names = config::BinSpec::declared_names(entry.common().bin.as_ref(), default);
+        let names = config::BinSpec::declared_names(common.bin.as_ref(), default);
         if names.contains(&command) {
             println!("{key}");
             return Ok(());

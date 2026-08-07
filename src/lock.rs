@@ -58,6 +58,27 @@ pub fn parse(input: &str) -> anyhow::Result<Lock> {
     toml::from_str(input).context("failed to parse rig.lock")
 }
 
+/// Shared base for tests that need a `ToolLock` — [TEST-1]: extract once a
+/// 2nd test file needs full construction. Override fields with `..`.
+#[cfg(test)]
+pub fn test_tool_lock() -> ToolLock {
+    ToolLock {
+        version: "1.0.0".to_string(),
+        source: "github:test/test".to_string(),
+        installed_at: OffsetDateTime::UNIX_EPOCH,
+        bins: Vec::new(),
+        completions: Vec::new(),
+        asset: None,
+        size: None,
+        pkg: None,
+        manager: None,
+        root: None,
+        eval_cacheable: None,
+        eval_cached_output: None,
+        eval_evidence: Vec::new(),
+    }
+}
+
 pub fn load(path: &Path) -> anyhow::Result<Lock> {
     let text =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;

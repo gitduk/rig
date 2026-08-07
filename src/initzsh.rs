@@ -8,23 +8,31 @@ use crate::config::{self, BinSpec, Common, Config, EvalSpec, tool_key};
 use crate::lock::{Lock, ToolLock};
 use crate::paths::Layout;
 
-/// Reads a previously generated `init.zsh`'s `RIG_CMD` block back out —
-/// lets `rig sync` diff old vs new declared tools without a config snapshot.
+/// Reads back `RIG_CMD` plus the `# rig-plugin:` markers `render_plugins`
+/// leaves (plugins never enter `RIG_CMD`) — lets `sync` diff declared tools.
 pub fn declared_tool_keys(init_zsh: &str) -> HashSet<String> {
-    init_zsh
-        .lines()
-        .skip_while(|line| line.trim() != "RIG_CMD=(")
-        .skip(1)
-        .take_while(|line| line.trim() != ")")
-        .filter_map(|line| line.split_whitespace().nth(1))
-        .map(str::to_string)
-        .collect()
+    let mut keys = HashSet::new();
+    let mut in_rig_cmd = false;
+    for line in init_zsh.lines() {
+        if let Some(plugin) = line.strip_prefix("# rig-plugin: ") {
+            keys.insert(plugin.to_string());
+        } else if in_rig_cmd {
+            if line.trim() == ")" {
+                in_rig_cmd = false;
+            } else if let Some(name) = line.split_whitespace().nth(1) {
+                keys.insert(name.to_string());
+            }
+        } else if line.trim() == "RIG_CMD=(" {
+            in_rig_cmd = true;
+        }
+    }
+    keys
 }
 
 pub fn render(config: &Config, lock: &Lock, layout: &Layout) -> String {
     let entries: Vec<(String, &Common)> = config::all_entries(config)
         .into_iter()
-        .map(|e| (e.key(), e.common()))
+        .filter_map(|e| e.common().map(|c| (e.key(), c)))
         .collect();
     let eager: Vec<(String, &Common)> = entries.iter().filter(|(_, c)| !c.lazy).cloned().collect();
 
@@ -96,11 +104,15 @@ fn escape_dquoted(value: &str) -> String {
 fn render_rig_cmd_and_handler(out: &mut String, config: &Config, layout: &Layout) {
     out.push_str("typeset -gA RIG_CMD\nRIG_CMD=(\n");
     for entry in config::all_entries(config) {
+        // A plugin is sourced, never invoked by command name.
+        let Some(common) = entry.common() else {
+            continue;
+        };
         let key = entry.key();
         // The lock key stays scope-prefixed, but a real command is never
         // typed with the `@scope/` prefix — guess by last path segment.
         let default = tool_key(entry.name());
-        for cmd in BinSpec::declared_names(entry.common().bin.as_ref(), default) {
+        for cmd in BinSpec::declared_names(common.bin.as_ref(), default) {
             out.push_str(&format!("  {cmd} {key}\n"));
         }
     }
@@ -152,7 +164,10 @@ fn render_eval_text(eval: &EvalSpec, tool_lock: &ToolLock) -> String {
 /// whichever trigger fires first (command name, or `bind`'s ZLE widget).
 fn render_lazy_blocks(out: &mut String, config: &Config, lock: &Lock) {
     for entry in config::all_entries(config) {
-        let common = entry.common();
+        // A plugin has no `Common` and thus can never be `lazy`.
+        let Some(common) = entry.common() else {
+            continue;
+        };
         if !common.lazy || (common.env.is_empty() && common.eval.is_none() && common.run.is_none())
         {
             continue;
@@ -226,6 +241,7 @@ fn zsh_ident(key: &str) -> String {
 fn render_plugins(out: &mut String, config: &Config, layout: &Layout) {
     for plugin in &config.plugin {
         let key = tool_key(&plugin.name);
+        out.push_str(&format!("# rig-plugin: {key}\n"));
         let clone_dir = layout.plugins_dir.join(key);
         if let Some(source) = &plugin.source {
             out.push_str(&format!("source {}\n", clone_dir.join(source).display()));
@@ -451,6 +467,28 @@ mod tests {
         assert!(keys.contains("fd"));
     }
 
+    /// A plugin never enters `RIG_CMD` — without this, `sync`'s diff report
+    /// would call every plugin newly "added" on every single run.
+    #[test]
+    fn declared_tool_keys_also_round_trips_plugin_markers() {
+        let mut config = Config::default();
+        config.repo.push(repo_entry("dandavison/delta", None));
+        config.plugin.push(PluginEntry {
+            name: "zsh-users/zsh-autosuggestions".to_string(),
+            description: None,
+            source: Some("zsh-autosuggestions.zsh".to_string()),
+            defer: 1,
+            atload: None,
+        });
+
+        let out = render(&config, &Lock::default(), &layout());
+        let keys = declared_tool_keys(&out);
+
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains("delta"));
+        assert!(keys.contains("zsh-autosuggestions"));
+    }
+
     #[test]
     fn cached_eval_is_inlined_and_live_eval_is_not() {
         let mut config = Config::default();
@@ -501,6 +539,7 @@ mod tests {
         let mut config = Config::default();
         config.plugin.push(PluginEntry {
             name: "zsh-users/zsh-autosuggestions".to_string(),
+            description: None,
             source: Some("zsh-autosuggestions.zsh".to_string()),
             defer: 1,
             atload: Some("_zsh_autosuggest_start".to_string()),
@@ -529,6 +568,7 @@ mod tests {
         ));
         config.plugin.push(PluginEntry {
             name: "zsh-users/zsh-autosuggestions".to_string(),
+            description: None,
             source: Some("zsh-autosuggestions.zsh".to_string()),
             defer: 1,
             atload: Some("ZSH_AUTOSUGGEST_STRATEGY=(match_prev_cmd history)".to_string()),
