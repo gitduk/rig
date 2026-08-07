@@ -1,9 +1,13 @@
 # rig bootstrap — https://github.com/gitduk/rig
 #
 # .zshrc only needs:
-#   [[ -f ~/.local/share/rig/rig.zsh ]] || curl -fsSL -o ~/.local/share/rig/rig.zsh \
-#     https://github.com/gitduk/rig/releases/latest/download/rig.zsh
-#   source ~/.local/share/rig/rig.zsh
+#   _rig_zsh=$HOME/.local/share/rig/rig.zsh
+#   [[ -f $_rig_zsh ]] || {
+#     mkdir -p ${_rig_zsh:h}
+#     curl -fsSL -o $_rig_zsh \
+#       https://github.com/gitduk/rig/releases/latest/download/rig.zsh
+#   }
+#   source $_rig_zsh
 
 RIG_BIN=~/.local/bin/rig
 if [[ ! -x $RIG_BIN ]]; then
