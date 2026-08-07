@@ -366,12 +366,18 @@ pub fn all_entries(config: &Config) -> Vec<ResolvedEntry<'_>> {
     entries
 }
 
-/// Matches either form so `rig install delta` and `rig install
-/// dandavison/delta` both work.
+/// Matches key, full name, or a declared command name (`rg` for
+/// `BurntSushi/ripgrep`) — same identity `rig which` already resolves by.
 pub fn resolve_tool<'a>(config: &'a Config, requested: &str) -> Option<ResolvedEntry<'a>> {
-    all_entries(config)
-        .into_iter()
-        .find(|e| e.key() == requested || e.name() == requested)
+    all_entries(config).into_iter().find(|e| {
+        e.key() == requested
+            || e.name() == requested
+            || e.common().is_some_and(|c| {
+                BinSpec::declared_names(c.bin.as_ref(), tool_key(e.name()))
+                    .iter()
+                    .any(|n| n == requested)
+            })
+    })
 }
 
 pub fn parse(input: &str) -> anyhow::Result<Config> {
@@ -493,6 +499,26 @@ atload = "_zsh_autosuggest_start"
             cfg.plugin[0].source.as_deref(),
             Some("zsh-autosuggestions.zsh")
         );
+    }
+
+    #[test]
+    fn resolve_tool_matches_key_name_or_declared_bin() {
+        let cfg = parse(
+            r#"
+[[repo]]
+name = "BurntSushi/ripgrep"
+bin = "rg"
+"#,
+        )
+        .expect("sample config should parse");
+
+        assert_eq!(resolve_tool(&cfg, "ripgrep").unwrap().key(), "ripgrep");
+        assert_eq!(
+            resolve_tool(&cfg, "BurntSushi/ripgrep").unwrap().key(),
+            "ripgrep"
+        );
+        assert_eq!(resolve_tool(&cfg, "rg").unwrap().key(), "ripgrep");
+        assert!(resolve_tool(&cfg, "not-configured").is_none());
     }
 
     #[test]
