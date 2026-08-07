@@ -312,7 +312,6 @@ fn remove_one(ctx: &mut Ctx, requested: &str) -> anyhow::Result<()> {
 fn cmd_list() -> anyhow::Result<()> {
     let ctx = Ctx::load()?;
     let entries = config::all_entries(&ctx.config);
-    let width = entries.iter().map(|e| e.key().len()).max().unwrap_or(0);
     for entry in &entries {
         let key = entry.key();
         let marker = if ctx.lock.tool.contains_key(&key) {
@@ -321,7 +320,7 @@ fn cmd_list() -> anyhow::Result<()> {
             "\u{25cb}"
         };
         match entry.description() {
-            Some(desc) => println!("{marker} {key:width$}  {desc}"),
+            Some(desc) => println!("{marker} {key} - {desc}"),
             None => println!("{marker} {key}"),
         }
     }
