@@ -236,8 +236,9 @@ fn zsh_ident(key: &str) -> String {
         .collect()
 }
 
-/// Plugins are sourced in config order — no defer mechanism exists yet
-/// (measured it wasn't worth building).
+/// Plugins are sourced in config order, and each plugin's `run` is emitted
+/// right after its `source` — the functions `run` may call are only defined
+/// once the plugin has been sourced.
 fn render_plugins(out: &mut String, config: &Config, layout: &Layout) {
     for plugin in &config.plugin {
         let key = tool_key(&plugin.name);
@@ -246,9 +247,11 @@ fn render_plugins(out: &mut String, config: &Config, layout: &Layout) {
         if let Some(source) = &plugin.source {
             out.push_str(&format!("source {}\n", clone_dir.join(source).display()));
         }
-        if let Some(atload) = &plugin.atload {
-            out.push_str(atload);
-            out.push('\n');
+        if let Some(run) = &plugin.run {
+            for line in run.lines() {
+                out.push_str(line);
+                out.push('\n');
+            }
         }
         out.push('\n');
     }
@@ -477,8 +480,7 @@ mod tests {
             name: "zsh-users/zsh-autosuggestions".to_string(),
             description: None,
             source: Some("zsh-autosuggestions.zsh".to_string()),
-            defer: 1,
-            atload: None,
+            run: None,
         });
 
         let out = render(&config, &Lock::default(), &layout());
@@ -535,14 +537,13 @@ mod tests {
     }
 
     #[test]
-    fn plugin_source_and_atload_are_emitted() {
+    fn plugin_source_and_run_are_emitted() {
         let mut config = Config::default();
         config.plugin.push(PluginEntry {
             name: "zsh-users/zsh-autosuggestions".to_string(),
             description: None,
             source: Some("zsh-autosuggestions.zsh".to_string()),
-            defer: 1,
-            atload: Some("_zsh_autosuggest_start".to_string()),
+            run: Some(RunSpec::Single("_zsh_autosuggest_start".to_string())),
         });
 
         let out = render(&config, &Lock::default(), &layout());
@@ -570,8 +571,9 @@ mod tests {
             name: "zsh-users/zsh-autosuggestions".to_string(),
             description: None,
             source: Some("zsh-autosuggestions.zsh".to_string()),
-            defer: 1,
-            atload: Some("ZSH_AUTOSUGGEST_STRATEGY=(match_prev_cmd history)".to_string()),
+            run: Some(RunSpec::Single(
+                "ZSH_AUTOSUGGEST_STRATEGY=(match_prev_cmd history)".to_string(),
+            )),
         });
         let mut env = HashMap::new();
         env.insert("ATUIN_TMUX_POPUP".to_string(), "false".to_string());

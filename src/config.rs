@@ -278,18 +278,17 @@ pub struct CurlEntry {
 
 /// `[[plugin]]`: Job B, zsh loads it. Rig only clones/updates.
 /// No `Common` here — `bin`/`eval`/`setup`/`lazy`/`bind` describe an
-/// installed *command*, and a plugin is never invoked by name.
+/// installed *command*, and a plugin is never invoked by name. `run` is
+/// the one shared field: same shape as `Common::run`, but rendered right
+/// after `source` (plugins are always eager — no `lazy`/`bind`).
 #[derive(Debug, Deserialize)]
 pub struct PluginEntry {
     pub name: String,
     pub description: Option<String>,
     pub source: Option<String>,
-    /// Parsed but not acted on — a defer mechanism wasn't worth building,
-    /// so `initzsh.rs` sources plugins in config order instead.
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub defer: u32,
-    pub atload: Option<String>,
+    /// Plain shell text run right after the plugin is sourced — e.g. a
+    /// function the plugin just defined.
+    pub run: Option<RunSpec>,
 }
 
 /// The default command name doubles as the tool's short identity
@@ -467,8 +466,7 @@ manager = "bun"
 [[plugin]]
 name = "zsh-users/zsh-autosuggestions"
 source = "zsh-autosuggestions.zsh"
-defer = 1
-atload = "_zsh_autosuggest_start"
+run = "_zsh_autosuggest_start"
 "#;
 
     #[test]
@@ -494,7 +492,9 @@ atload = "_zsh_autosuggest_start"
 
         assert_eq!(cfg.node[0].manager, NodeManager::Bun);
 
-        assert_eq!(cfg.plugin[0].defer, 1);
+        assert!(
+            matches!(&cfg.plugin[0].run, Some(RunSpec::Single(s)) if s == "_zsh_autosuggest_start")
+        );
         assert_eq!(
             cfg.plugin[0].source.as_deref(),
             Some("zsh-autosuggestions.zsh")

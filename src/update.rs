@@ -322,8 +322,7 @@ mod tests {
             name: "zsh-users/zsh-autosuggestions".to_string(),
             description: None,
             source: Some("zsh-autosuggestions.zsh".to_string()),
-            defer: 1,
-            atload: None,
+            run: None,
         }
     }
 
