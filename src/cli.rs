@@ -1,5 +1,6 @@
 //! Subcommand dispatch: install/update/remove/list/sync/doctor/which.
 //! `main.rs` is a one-line wrapper around `run`.
+use std::collections::HashSet;
 use std::fs;
 use std::io::IsTerminal as _;
 use std::process::ExitCode;
@@ -10,8 +11,9 @@ use clap::{Parser, Subcommand};
 use crate::config::{self, Config, ResolvedEntry};
 use crate::doctor;
 use crate::initzsh;
-use crate::lock::{self, Lock};
+use crate::lock::{self, Lock, ToolLock};
 use crate::paths::{self, Layout};
+use crate::pool;
 use crate::remove;
 use crate::sources;
 use crate::update;
@@ -26,28 +28,36 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Install one or more configured tools
+    #[command(visible_alias = "i")]
     Install { tools: Vec<String> },
     /// Update tools (omit to update everything in config.toml)
+    #[command(visible_alias = "u")]
     Update {
         tools: Vec<String>,
         #[arg(long)]
         force: bool,
     },
     /// Remove an installed tool's rig-owned files
+    #[command(visible_alias = "rm")]
     Remove { tools: Vec<String> },
     /// List configured tools and whether they're installed
+    #[command(visible_alias = "ls")]
     List,
     /// Regenerate init.zsh from the current config
+    #[command(visible_alias = "s")]
     Sync {
         /// Re-probe every tool's `eval` cacheability in place
         #[arg(long)]
         force: bool,
     },
     /// Run diagnostic checks
+    #[command(visible_alias = "d")]
     Doctor,
     /// Resolve a command name to the tool that provides it
+    #[command(visible_alias = "w")]
     Which { command: String },
     /// Print a shell completion script for `rig` itself
+    #[command(visible_alias = "c")]
     Completions { shell: clap_complete::Shell },
 }
 
@@ -142,20 +152,75 @@ fn cmd_install(tools: Vec<String>) -> anyhow::Result<ExitCode> {
     if tools.is_empty() {
         bail!("specify at least one tool to install");
     }
-    let mut ctx = Ctx::load()?;
+    let Ctx {
+        config,
+        mut lock,
+        layout,
+    } = Ctx::load()?;
+    let workers = config.settings.parallel as usize;
+
+    // Normalize to lock keys and dedup: `rig install delta dandavison/delta`
+    // is one tool. Two workers racing on the same key would both pass the
+    // snapshot-based conflict check, then trip each other's "already exists
+    // and isn't tracked" guard on the freshly-created symlink.
+    let mut seen = HashSet::new();
+    let tools: Vec<String> = tools
+        .into_iter()
+        .map(|t| {
+            config::resolve_tool(&config, &t)
+                .map(|r| r.key())
+                .unwrap_or(t)
+        })
+        .filter(|key| seen.insert(key.clone()))
+        .collect();
+
+    // Workers only read shared state, so the conflict check runs against a
+    // snapshot taken at batch start. The merge below keeps the first-recorded
+    // lock entry — same outcome as the serial path, where the second install
+    // of an already-tracked tool is a no-op.
+    let lock_snapshot = lock.clone();
 
     // Save after every tool, not once at batch end — a killed process must
     // not lose lock state for tools that already finished installing.
     let mut failed = false;
-    for name in &tools {
-        match install_entry(&mut ctx, name).and_then(|()| ctx.save()) {
-            Ok(()) => {}
+    pool::run_pool(
+        tools,
+        workers,
+        |name| install_one(&config, &lock_snapshot, &layout, name),
+        |name, result| match result {
+            Ok((key, Some(tool_lock))) => {
+                if lock.tool.contains_key(&key) {
+                    return; // a racing install of the same key won
+                }
+                let version = tool_lock.version.clone();
+                lock.tool.insert(key.clone(), tool_lock);
+                if let Err(e) = lock::save_and_sync(&config, &lock, &layout) {
+                    failed = true;
+                    print_error(Some(&name), &e);
+                } else {
+                    println!("installed {key} {version}");
+                }
+            }
+            Ok((key, None)) => {
+                // A `None` result means the tool was healthy in the
+                // batch-start snapshot; the merged lock only grows from
+                // there, so the entry is guaranteed present.
+                let existing = lock
+                    .tool
+                    .get(&key)
+                    .expect("a healthy tool's lock entry can't vanish mid-batch");
+                println!(
+                    "{key} is already installed ({}) — use `rig update {key}` to check \
+                     for a newer version, or `rig remove {key}` first to force a clean reinstall",
+                    existing.version
+                );
+            }
             Err(e) => {
                 failed = true;
-                print_error(Some(name), &e);
+                print_error(Some(&name), &e);
             }
-        }
-    }
+        },
+    );
 
     Ok(if failed {
         ExitCode::FAILURE
@@ -164,14 +229,22 @@ fn cmd_install(tools: Vec<String>) -> anyhow::Result<ExitCode> {
     })
 }
 
-fn install_entry(ctx: &mut Ctx, requested: &str) -> anyhow::Result<()> {
-    let resolved = config::resolve_tool(&ctx.config, requested)
+/// Installs one tool, returning `(key, Option<ToolLock>)` — `None` when the
+/// tool was already healthy at batch start. Pure: reads `config`/`lock`/
+/// `layout`, never mutates them; the caller merges and persists.
+fn install_one(
+    config: &Config,
+    lock: &Lock,
+    layout: &Layout,
+    requested: &str,
+) -> anyhow::Result<(String, Option<ToolLock>)> {
+    let resolved = config::resolve_tool(config, requested)
         .ok_or_else(|| anyhow!("{requested} is not in config.toml"))?;
     let key = resolved.key();
 
     // Skip only if genuinely healthy — a dangling bin must still fall
     // through, since `command_not_found_handler` relies on this to self-heal.
-    if let Some(existing) = ctx.lock.tool.get(&key) {
+    if let Some(existing) = lock.tool.get(&key) {
         let healthy = match resolved {
             // A plugin has no bins — "healthy" means its clone still exists.
             ResolvedEntry::Plugin(_) => existing
@@ -187,35 +260,46 @@ fn install_entry(ctx: &mut Ctx, requested: &str) -> anyhow::Result<()> {
             }
         };
         if healthy {
-            println!(
-                "{key} is already installed ({}) — use `rig update {key}` to check \
-                 for a newer version, or `rig remove {key}` first to force a clean reinstall",
-                existing.version
-            );
-            return Ok(());
+            return Ok((key, None));
         }
     }
 
     let new_lock = match resolved {
-        ResolvedEntry::Repo(e) => {
-            sources::repo::install(e, &ctx.layout, &ctx.lock, sources::Phase::Install)?
-        }
-        ResolvedEntry::Git(e) => {
-            sources::git::install(e, &ctx.layout, &ctx.lock, sources::Phase::Install)?
-        }
+        ResolvedEntry::Repo(e) => sources::repo::install(e, layout, lock, sources::Phase::Install)?,
+        ResolvedEntry::Git(e) => sources::git::install(e, layout, lock, sources::Phase::Install)?,
         ResolvedEntry::Cargo(e) => {
-            sources::cargo::install(e, &ctx.layout, &ctx.lock, sources::Phase::Install)?
+            sources::cargo::install(e, layout, lock, sources::Phase::Install)?
         }
-        ResolvedEntry::Node(e) => {
-            sources::node::install(e, &ctx.layout, &ctx.lock, sources::Phase::Install)?
-        }
-        ResolvedEntry::Apt(e) => sources::apt::install(e, &ctx.layout, sources::Phase::Install)?,
-        ResolvedEntry::Curl(e) => sources::curl::install(e, &ctx.layout, sources::Phase::Install)?,
-        ResolvedEntry::Plugin(e) => sources::plugin::install(e, &ctx.layout)?,
+        ResolvedEntry::Node(e) => sources::node::install(e, layout, lock, sources::Phase::Install)?,
+        ResolvedEntry::Apt(e) => sources::apt::install(e, layout, sources::Phase::Install)?,
+        ResolvedEntry::Curl(e) => sources::curl::install(e, layout, sources::Phase::Install)?,
+        ResolvedEntry::Plugin(e) => sources::plugin::install(e, layout)?,
     };
-    println!("installed {key} {}", new_lock.version);
-    ctx.lock.tool.insert(key, new_lock);
-    Ok(())
+    Ok((key, Some(new_lock)))
+}
+
+/// Serial wrapper for callers that need the lock merged immediately
+/// (`cmd_sync`'s plugin backfill) — same semantics as `install_one` + merge.
+fn install_entry(ctx: &mut Ctx, requested: &str) -> anyhow::Result<()> {
+    match install_one(&ctx.config, &ctx.lock, &ctx.layout, requested)? {
+        (key, Some(tool_lock)) => {
+            println!("installed {key} {}", tool_lock.version);
+            ctx.lock.tool.insert(key, tool_lock);
+            Ok(())
+        }
+        (key, None) => {
+            // install_one no longer prints the skip notice — restore the
+            // serial behavior for callers that hit an already-healthy tool.
+            if let Some(existing) = ctx.lock.tool.get(&key) {
+                println!(
+                    "{key} is already installed ({}) — use `rig update {key}` to check \
+                     for a newer version, or `rig remove {key}` first to force a clean reinstall",
+                    existing.version
+                );
+            }
+            Ok(())
+        }
+    }
 }
 
 fn cmd_update(tools: Vec<String>, force: bool) -> anyhow::Result<ExitCode> {

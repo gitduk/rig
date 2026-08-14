@@ -15,13 +15,13 @@ use crate::config::Config;
 use crate::initzsh;
 use crate::paths::Layout;
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct Lock {
     #[serde(default)]
     pub tool: BTreeMap<String, ToolLock>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ToolLock {
     pub version: String,
     pub source: String,

@@ -8,8 +8,9 @@ use crate::config::{
     self, AptEntry, CargoEntry, Config, CurlEntry, GitEntry, NodeEntry, PluginEntry, RepoEntry,
     ResolvedEntry,
 };
-use crate::lock::{self, Lock};
+use crate::lock::{self, Lock, ToolLock};
 use crate::paths::Layout;
+use crate::pool;
 use crate::sources;
 use crate::version;
 
@@ -38,6 +39,41 @@ pub struct Report {
     pub outcome: anyhow::Result<Outcome>,
 }
 
+/// A mutation a worker wants applied to `rig.lock`. Workers only read a
+/// snapshot taken at batch start; the main thread applies these in
+/// completion order, so lock writes stay serialized while the version
+/// queries and reinstall work runs concurrently.
+#[derive(Debug)]
+enum LockChange {
+    /// Replace the tool's whole lock entry (every real update path).
+    Replace(Box<ToolLock>),
+    /// `sync --force`: patch only the eval fields, version/bins untouched.
+    RefreshEval {
+        cacheable: Option<bool>,
+        output: Option<String>,
+        evidence: Vec<String>,
+    },
+}
+
+fn apply_change(lock: &mut Lock, key: &str, change: LockChange) {
+    match change {
+        LockChange::Replace(tool_lock) => {
+            lock.tool.insert(key.to_string(), *tool_lock);
+        }
+        LockChange::RefreshEval {
+            cacheable,
+            output,
+            evidence,
+        } => {
+            if let Some(tool) = lock.tool.get_mut(key) {
+                tool.eval_cacheable = cacheable;
+                tool.eval_cached_output = output;
+                tool.eval_evidence = evidence;
+            }
+        }
+    }
+}
+
 /// `filter`: `None` = all configured tools (`rig update`); `Some(names)` =
 /// only those lock keys (`rig update <tool...>`).
 pub fn update_all(
@@ -49,62 +85,120 @@ pub fn update_all(
     filter: Option<&[String]>,
 ) -> Vec<Report> {
     let wanted = |key: &str| filter.is_none_or(|names| names.iter().any(|n| n == key));
+    // Collect (key, full name): the key feeds the report, but `resolve_tool`
+    // is only unambiguous on the full name — two entries can share a key
+    // (e.g. `foo/bar` and `baz/bar` both key as `bar`), and resolving by
+    // key would silently pick the first one for both.
+    let targets: Vec<(String, String)> = config::all_entries(config)
+        .into_iter()
+        .filter(|e| wanted(&e.key()))
+        .map(|e| (e.key(), e.name().to_string()))
+        .collect();
+    let workers = config.settings.parallel as usize;
+
+    // Workers only read shared state, so the version check and reinstall
+    // run against a snapshot taken at batch start. Each tool touches only
+    // its own lock key, so stale reads can't cross-contaminate; the main
+    // thread merges every result as it arrives.
+    let lock_snapshot = lock.clone();
 
     let mut reports = Vec::new();
-    for entry in config::all_entries(config) {
-        let tool = entry.key();
-        if !wanted(&tool) {
-            continue;
-        }
-        let outcome = if refresh_eval {
-            refresh_eval_cache(&entry, &tool, lock)
-        } else {
-            match entry {
-                ResolvedEntry::Repo(e) => update_repo(e, &tool, lock, layout, force),
-                ResolvedEntry::Git(e) => update_git(e, &tool, lock, layout, force),
-                ResolvedEntry::Cargo(e) => update_cargo(e, &tool, lock, layout, force),
-                ResolvedEntry::Node(e) => update_node(e, &tool, lock, layout, force),
-                ResolvedEntry::Apt(e) => update_apt(e, &tool, lock, layout),
-                ResolvedEntry::Curl(e) => update_curl(e, &tool, lock, layout),
-                ResolvedEntry::Plugin(e) => update_plugin(e, &tool, lock, layout, force),
-            }
-        };
-        // Persist right after a lock-mutating outcome, not once at the end
-        // of the batch — a killed process must not lose already-updated tools.
-        let outcome = match outcome {
-            Ok(o @ (Outcome::Updated { .. } | Outcome::Reran | Outcome::EvalRefreshed { .. })) => {
-                lock::save_and_sync(config, lock, layout).map(|()| o)
-            }
-            other => other,
-        };
-        reports.push(Report { tool, outcome });
-    }
+    pool::run_pool(
+        targets,
+        workers,
+        |(_, name)| update_one(config, &lock_snapshot, layout, name, force, refresh_eval),
+        |(tool, _), result| {
+            // `Some(change)` is exactly "must persist": every producer pairs
+            // a mutating outcome (Updated/Reran/EvalRefreshed) with a change.
+            let report = match result {
+                Ok((outcome, Some(change))) => {
+                    apply_change(lock, &tool, change);
+                    // Persist right after a lock-mutating outcome, not once
+                    // at batch end — a killed process must not lose
+                    // already-updated tools.
+                    match lock::save_and_sync(config, lock, layout) {
+                        Ok(()) => Report {
+                            tool,
+                            outcome: Ok(outcome),
+                        },
+                        Err(e) => Report {
+                            tool,
+                            outcome: Err(e),
+                        },
+                    }
+                }
+                Ok((outcome, None)) => Report {
+                    tool,
+                    outcome: Ok(outcome),
+                },
+                Err(e) => Report {
+                    tool,
+                    outcome: Err(e),
+                },
+            };
+            reports.push(report);
+        },
+    );
     reports
 }
 
-/// Re-probes `eval` and patches the lock entry in place, unlike a real
-/// update: version, bins, and completions are left untouched.
+/// One tool's update inside a worker: re-resolve the tool's full name to
+/// its entry (workers can't hold `ResolvedEntry` borrows across threads,
+/// only the snapshot), then dispatch exactly like the old serial loop did.
+/// The lock key is derived from the resolved entry — the config name is
+/// only the unambiguous resolution handle.
+fn update_one(
+    config: &Config,
+    lock: &Lock,
+    layout: &Layout,
+    name: &str,
+    force: bool,
+    refresh_eval: bool,
+) -> anyhow::Result<(Outcome, Option<LockChange>)> {
+    let entry = config::resolve_tool(config, name)
+        .ok_or_else(|| anyhow!("{name} is not in config.toml"))?;
+    let key = entry.key();
+    if refresh_eval {
+        refresh_eval_cache(&entry, &key, lock)
+    } else {
+        match entry {
+            ResolvedEntry::Repo(e) => update_repo(e, &key, lock, layout, force),
+            ResolvedEntry::Git(e) => update_git(e, &key, lock, layout, force),
+            ResolvedEntry::Cargo(e) => update_cargo(e, &key, lock, layout, force),
+            ResolvedEntry::Node(e) => update_node(e, &key, lock, layout, force),
+            ResolvedEntry::Apt(e) => update_apt(e, &key, lock, layout),
+            ResolvedEntry::Curl(e) => update_curl(e, &key, lock, layout),
+            ResolvedEntry::Plugin(e) => update_plugin(e, &key, lock, layout, force),
+        }
+    }
+}
+
+/// Re-probes `eval` and returns the patch, unlike a real update: version,
+/// bins, and completions are left untouched. `apply_change` does the write.
 fn refresh_eval_cache(
     entry: &ResolvedEntry,
     key: &str,
-    lock: &mut Lock,
-) -> anyhow::Result<Outcome> {
-    let tool = lock
-        .tool
-        .get_mut(key)
-        .ok_or_else(|| anyhow!("{key} is not installed; run `rig install {key}` first"))?;
+    lock: &Lock,
+) -> anyhow::Result<(Outcome, Option<LockChange>)> {
+    if !lock.tool.contains_key(key) {
+        bail!("{key} is not installed; run `rig install {key}` first");
+    }
     let Some(eval) = entry.common().and_then(|c| c.eval.as_ref()) else {
-        return Ok(Outcome::NoEval);
+        return Ok((Outcome::NoEval, None));
     };
 
     let (eval_cacheable, eval_cached_output, eval_evidence) =
         sources::resolve_eval_cache(Some(eval));
-    tool.eval_cacheable = eval_cacheable;
-    tool.eval_cached_output = eval_cached_output;
-    tool.eval_evidence = eval_evidence;
-    Ok(Outcome::EvalRefreshed {
-        cacheable: eval_cacheable,
-    })
+    Ok((
+        Outcome::EvalRefreshed {
+            cacheable: eval_cacheable,
+        },
+        Some(LockChange::RefreshEval {
+            cacheable: eval_cacheable,
+            output: eval_cached_output,
+            evidence: eval_evidence,
+        }),
+    ))
 }
 
 fn already_installed(lock: &Lock, key: &str) -> anyhow::Result<String> {
@@ -117,51 +211,61 @@ fn already_installed(lock: &Lock, key: &str) -> anyhow::Result<String> {
 fn update_repo(
     entry: &RepoEntry,
     key: &str,
-    lock: &mut Lock,
+    lock: &Lock,
     layout: &Layout,
     force: bool,
-) -> anyhow::Result<Outcome> {
+) -> anyhow::Result<(Outcome, Option<LockChange>)> {
     let current_version = already_installed(lock, key)?;
 
     let release = version::github::latest_release(&entry.name, entry.host)?;
     if !force && release.tag == current_version {
-        return Ok(Outcome::UpToDate {
-            version: current_version,
-        });
+        return Ok((
+            Outcome::UpToDate {
+                version: current_version,
+            },
+            None,
+        ));
     }
 
     let new_lock = sources::repo::install(entry, layout, lock, sources::Phase::Update)?;
     let to = new_lock.version.clone();
-    lock.tool.insert(key.to_string(), new_lock);
-    Ok(Outcome::Updated {
-        from: current_version,
-        to,
-    })
+    Ok((
+        Outcome::Updated {
+            from: current_version,
+            to,
+        },
+        Some(LockChange::Replace(Box::new(new_lock))),
+    ))
 }
 
 fn update_git(
     entry: &GitEntry,
     key: &str,
-    lock: &mut Lock,
+    lock: &Lock,
     layout: &Layout,
     force: bool,
-) -> anyhow::Result<Outcome> {
+) -> anyhow::Result<(Outcome, Option<LockChange>)> {
     let current_version = already_installed(lock, key)?;
 
     let latest = sources::git::remote_head_commit(entry.host, &entry.name)?;
     if !force && latest == current_version {
-        return Ok(Outcome::UpToDate {
-            version: current_version,
-        });
+        return Ok((
+            Outcome::UpToDate {
+                version: current_version,
+            },
+            None,
+        ));
     }
 
     let new_lock = sources::git::install(entry, layout, lock, sources::Phase::Update)?;
     let to = new_lock.version.clone();
-    lock.tool.insert(key.to_string(), new_lock);
-    Ok(Outcome::Updated {
-        from: current_version,
-        to,
-    })
+    Ok((
+        Outcome::Updated {
+            from: current_version,
+            to,
+        },
+        Some(LockChange::Replace(Box::new(new_lock))),
+    ))
 }
 
 /// This is rig's improvement over bare `cargo install --force`, which has
@@ -169,35 +273,40 @@ fn update_git(
 fn update_cargo(
     entry: &CargoEntry,
     key: &str,
-    lock: &mut Lock,
+    lock: &Lock,
     layout: &Layout,
     force: bool,
-) -> anyhow::Result<Outcome> {
+) -> anyhow::Result<(Outcome, Option<LockChange>)> {
     let current_version = already_installed(lock, key)?;
 
     let latest = version::crates_io::latest_version(&entry.name)?;
     if !force && latest == current_version {
-        return Ok(Outcome::UpToDate {
-            version: current_version,
-        });
+        return Ok((
+            Outcome::UpToDate {
+                version: current_version,
+            },
+            None,
+        ));
     }
 
     let new_lock = sources::cargo::install(entry, layout, lock, sources::Phase::Update)?;
     let to = new_lock.version.clone();
-    lock.tool.insert(key.to_string(), new_lock);
-    Ok(Outcome::Updated {
-        from: current_version,
-        to,
-    })
+    Ok((
+        Outcome::Updated {
+            from: current_version,
+            to,
+        },
+        Some(LockChange::Replace(Box::new(new_lock))),
+    ))
 }
 
 fn update_node(
     entry: &NodeEntry,
     key: &str,
-    lock: &mut Lock,
+    lock: &Lock,
     layout: &Layout,
     force: bool,
-) -> anyhow::Result<Outcome> {
+) -> anyhow::Result<(Outcome, Option<LockChange>)> {
     let current = lock
         .tool
         .get(key)
@@ -212,19 +321,24 @@ fn update_node(
 
     let latest = version::npm::latest(&entry.name)?.version;
     if !force && latest == current_version {
-        return Ok(Outcome::UpToDate {
-            version: current_version,
-        });
+        return Ok((
+            Outcome::UpToDate {
+                version: current_version,
+            },
+            None,
+        ));
     }
 
     let new_lock =
         sources::node::install_with_manager(entry, layout, lock, manager, sources::Phase::Update)?;
     let to = new_lock.version.clone();
-    lock.tool.insert(key.to_string(), new_lock);
-    Ok(Outcome::Updated {
-        from: current_version,
-        to,
-    })
+    Ok((
+        Outcome::Updated {
+            from: current_version,
+            to,
+        },
+        Some(LockChange::Replace(Box::new(new_lock))),
+    ))
 }
 
 /// No cheap pre-check exists, so this always runs `apt-get install` (a
@@ -232,37 +346,39 @@ fn update_node(
 fn update_apt(
     entry: &AptEntry,
     key: &str,
-    lock: &mut Lock,
+    lock: &Lock,
     layout: &Layout,
-) -> anyhow::Result<Outcome> {
+) -> anyhow::Result<(Outcome, Option<LockChange>)> {
     let current_version = already_installed(lock, key)?;
 
     let new_lock = sources::apt::install(entry, layout, sources::Phase::Update)?;
     let to = new_lock.version.clone();
-    lock.tool.insert(key.to_string(), new_lock);
-
     if to == current_version {
-        Ok(Outcome::UpToDate { version: to })
-    } else {
-        Ok(Outcome::Updated {
+        return Ok((Outcome::UpToDate { version: to }, None));
+    }
+    Ok((
+        Outcome::Updated {
             from: current_version,
             to,
-        })
-    }
+        },
+        Some(LockChange::Replace(Box::new(new_lock))),
+    ))
 }
 
 fn update_curl(
     entry: &CurlEntry,
     key: &str,
-    lock: &mut Lock,
+    lock: &Lock,
     layout: &Layout,
-) -> anyhow::Result<Outcome> {
+) -> anyhow::Result<(Outcome, Option<LockChange>)> {
     if !lock.tool.contains_key(key) {
         bail!("{key} is not installed; run `rig install {key}` first");
     }
     let new_lock = sources::curl::install(entry, layout, sources::Phase::Update)?;
-    lock.tool.insert(key.to_string(), new_lock);
-    Ok(Outcome::Reran)
+    Ok((
+        Outcome::Reran,
+        Some(LockChange::Replace(Box::new(new_lock))),
+    ))
 }
 
 /// No cheap pre-check like `update_repo`'s — `git pull` itself must
@@ -270,10 +386,10 @@ fn update_curl(
 fn update_plugin(
     entry: &PluginEntry,
     key: &str,
-    lock: &mut Lock,
+    lock: &Lock,
     layout: &Layout,
     force: bool,
-) -> anyhow::Result<Outcome> {
+) -> anyhow::Result<(Outcome, Option<LockChange>)> {
     let current_version = match lock.tool.get(key) {
         Some(tool) => tool.version.clone(),
         // A clone that predates plugin lock tracking — `sync` backfills it.
@@ -286,15 +402,20 @@ fn update_plugin(
     let new_lock = sources::plugin::update(entry, layout)?;
     let to = new_lock.version.clone();
     if !force && to == current_version {
-        return Ok(Outcome::UpToDate {
-            version: current_version,
-        });
+        return Ok((
+            Outcome::UpToDate {
+                version: current_version,
+            },
+            None,
+        ));
     }
-    lock.tool.insert(key.to_string(), new_lock);
-    Ok(Outcome::Updated {
-        from: current_version,
-        to,
-    })
+    Ok((
+        Outcome::Updated {
+            from: current_version,
+            to,
+        },
+        Some(LockChange::Replace(Box::new(new_lock))),
+    ))
 }
 
 #[cfg(test)]
@@ -328,12 +449,12 @@ mod tests {
 
     #[test]
     fn update_plugin_errors_when_never_cloned() {
-        let mut lock = Lock::default();
+        let lock = Lock::default();
         let tmp = tempfile::tempdir().expect("tempdir");
         let layout = Layout::new(tmp.path(), "~/.local");
         let entry = autosuggestions_entry();
 
-        let outcome = update_plugin(&entry, "zsh-autosuggestions", &mut lock, &layout, false);
+        let outcome = update_plugin(&entry, "zsh-autosuggestions", &lock, &layout, false);
         let message = outcome.unwrap_err().to_string();
         assert!(message.contains("not installed"));
         assert!(message.contains("rig install"));
@@ -343,26 +464,26 @@ mod tests {
     fn update_plugin_points_at_sync_for_an_untracked_clone() {
         // Simulates a clone that predates plugin lock tracking: the dest
         // dir exists on disk, but `rig.lock` has no entry for it yet.
-        let mut lock = Lock::default();
+        let lock = Lock::default();
         let tmp = tempfile::tempdir().expect("tempdir");
         let layout = Layout::new(tmp.path(), "~/.local");
         fs::create_dir_all(layout.plugins_dir.join("zsh-autosuggestions"))
             .expect("mkdir plugin clone");
         let entry = autosuggestions_entry();
 
-        let outcome = update_plugin(&entry, "zsh-autosuggestions", &mut lock, &layout, false);
+        let outcome = update_plugin(&entry, "zsh-autosuggestions", &lock, &layout, false);
         let message = outcome.unwrap_err().to_string();
         assert!(message.contains("rig sync"));
     }
 
     #[test]
     fn errors_when_tool_is_not_yet_installed() {
-        let mut lock = Lock::default();
+        let lock = Lock::default();
         let tmp = tempfile::tempdir().expect("tempdir");
         let layout = Layout::new(tmp.path(), "~/.local");
         let entry = delta_entry();
 
-        let outcome = update_repo(&entry, "delta", &mut lock, &layout, false);
+        let outcome = update_repo(&entry, "delta", &lock, &layout, false);
         assert!(outcome.is_err());
         assert!(outcome.unwrap_err().to_string().contains("not installed"));
     }
@@ -382,18 +503,20 @@ mod tests {
         entry.common.eval = Some(config::EvalSpec::Cmd("echo fresh-output".to_string()));
         let resolved = ResolvedEntry::Repo(&entry);
 
-        let outcome =
-            refresh_eval_cache(&resolved, "delta", &mut lock).expect("refresh should run");
+        let (outcome, change) =
+            refresh_eval_cache(&resolved, "delta", &lock).expect("refresh should run");
         assert!(matches!(
             outcome,
             Outcome::EvalRefreshed {
                 cacheable: Some(true)
             }
         ));
-        assert_eq!(
-            lock.tool["delta"].eval_cached_output.as_deref(),
-            Some("fresh-output\n")
-        );
+        match change {
+            Some(LockChange::RefreshEval { output, .. }) => {
+                assert_eq!(output.as_deref(), Some("fresh-output\n"));
+            }
+            other => panic!("expected a RefreshEval change, got {other:?}"),
+        }
     }
 
     #[test]
@@ -404,18 +527,19 @@ mod tests {
         let entry = delta_entry();
         let resolved = ResolvedEntry::Repo(&entry);
 
-        let outcome =
-            refresh_eval_cache(&resolved, "delta", &mut lock).expect("no-eval isn't an error");
+        let (outcome, change) =
+            refresh_eval_cache(&resolved, "delta", &lock).expect("no-eval isn't an error");
         assert!(matches!(outcome, Outcome::NoEval));
+        assert!(change.is_none());
     }
 
     #[test]
     fn refresh_eval_cache_errors_when_not_yet_installed() {
-        let mut lock = Lock::default();
+        let lock = Lock::default();
         let entry = delta_entry();
         let resolved = ResolvedEntry::Repo(&entry);
 
-        let outcome = refresh_eval_cache(&resolved, "delta", &mut lock);
+        let outcome = refresh_eval_cache(&resolved, "delta", &lock);
         assert!(outcome.is_err());
         assert!(outcome.unwrap_err().to_string().contains("not installed"));
     }
@@ -434,12 +558,12 @@ mod tests {
             .expect("initial install");
         lock.tool.insert("delta".to_string(), installed);
 
-        let outcome =
-            update_repo(&entry, "delta", &mut lock, &layout, false).expect("update should run");
+        let (outcome, _) =
+            update_repo(&entry, "delta", &lock, &layout, false).expect("update should run");
         assert!(matches!(outcome, Outcome::UpToDate { .. }), "{outcome:?}");
 
-        let outcome = update_repo(&entry, "delta", &mut lock, &layout, true)
-            .expect("forced update should run");
+        let (outcome, _) =
+            update_repo(&entry, "delta", &lock, &layout, true).expect("forced update should run");
         assert!(matches!(outcome, Outcome::Updated { .. }), "{outcome:?}");
     }
 }

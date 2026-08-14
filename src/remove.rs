@@ -14,7 +14,7 @@ use crate::sources::node::ResolvedManager;
 
 pub fn remove(tool: &ToolLock, layout: &Layout) -> anyhow::Result<()> {
     if let Some(manager) = &tool.manager {
-        uninstall_node_package(tool, manager)?;
+        uninstall_node_package(tool, manager, layout)?;
     } else if tool.source.starts_with("apt:") {
         uninstall_apt_package(tool)?;
     }
@@ -36,17 +36,29 @@ pub fn remove(tool: &ToolLock, layout: &Layout) -> anyhow::Result<()> {
 
 /// A node package's bins/root live outside `state_dir` (bun/npm own that
 /// tree), so only the manager can remove them.
-fn uninstall_node_package(tool: &ToolLock, manager: &str) -> anyhow::Result<()> {
+fn uninstall_node_package(tool: &ToolLock, manager: &str, layout: &Layout) -> anyhow::Result<()> {
     let name = tool
         .source
         .strip_prefix("node:")
         .with_context(|| format!("malformed node source in rig.lock: {}", tool.source))?;
-    let (bin, verb) = match ResolvedManager::parse(manager)? {
+    let manager = ResolvedManager::parse(manager)?;
+    let (bin, verb) = match manager {
         ResolvedManager::Bun => ("bun", "remove"),
         ResolvedManager::Npm => ("npm", "uninstall"),
     };
-    let status = Command::new(bin)
-        .args([verb, "-g", name])
+    let mut command = Command::new(bin);
+    command.args([verb, "-g", name]);
+    if let ResolvedManager::Bun = manager {
+        // install_via_bun pins $BUN_INSTALL to the rig prefix; remove must
+        // pin it the same way, or bun operates on whatever the caller's
+        // shell happens to have exported (wrong target, or none at all).
+        let prefix = layout
+            .prefix_bin_dir
+            .parent()
+            .context("prefix_bin_dir must have a parent")?;
+        command.env("BUN_INSTALL", prefix);
+    }
+    let status = command
         .status()
         .with_context(|| format!("failed to run `{bin} {verb} -g {name}`"))?;
     if !status.success() {
@@ -129,7 +141,9 @@ mod tests {
     fn uninstall_node_package_rejects_a_malformed_source() {
         let mut tool = tool_lock(Vec::new(), None);
         tool.source = "cargo:ripgrep".to_string();
-        let err = uninstall_node_package(&tool, "bun").expect_err("source has no node: prefix");
+        let layout = Layout::new(Path::new("/home/kaige"), "~/.local");
+        let err =
+            uninstall_node_package(&tool, "bun", &layout).expect_err("source has no node: prefix");
         assert!(err.to_string().contains("cargo:ripgrep"));
     }
 
@@ -137,8 +151,73 @@ mod tests {
     fn uninstall_node_package_rejects_an_unknown_manager() {
         let mut tool = tool_lock(Vec::new(), None);
         tool.source = "node:cowsay".to_string();
-        let err = uninstall_node_package(&tool, "yarn").expect_err("yarn isn't a known manager");
+        let layout = Layout::new(Path::new("/home/kaige"), "~/.local");
+        let err =
+            uninstall_node_package(&tool, "yarn", &layout).expect_err("yarn isn't a known manager");
         assert!(err.to_string().contains("yarn"));
+    }
+
+    #[test]
+    fn bun_uninstall_pins_bun_install_to_the_rig_prefix() {
+        // install_via_bun sets $BUN_INSTALL explicitly; the remove path
+        // must too, or bun operates on whatever the caller's shell exports.
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).expect("mkdir home");
+        let layout = Layout::new(&home, "~/.local");
+
+        // A fake `bun` that records $BUN_INSTALL instead of touching a registry.
+        let bin_dir = tmp.path().join("fakebin");
+        fs::create_dir_all(&bin_dir).expect("mkdir fakebin");
+        let captured = tmp.path().join("bun_install_value");
+        let script = format!(
+            "#!/bin/sh\necho \"$BUN_INSTALL\" > \"{}\"\n",
+            captured.display()
+        );
+        let fake_bun = bin_dir.join("bun");
+        fs::write(&fake_bun, script).expect("write fake bun");
+        let mut perms = fs::metadata(&fake_bun)
+            .expect("stat fake bun")
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_bun, perms).expect("chmod +x fake bun");
+
+        let old_path = std::env::var_os("PATH");
+        // SAFETY: restored before this test returns; no other test spawns
+        // a binary named `bun`, so a leak on panic can't cross-contaminate.
+        unsafe {
+            std::env::set_var(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin_dir.display(),
+                    old_path.as_deref().unwrap_or_default().to_string_lossy()
+                ),
+            );
+        }
+
+        let mut tool = tool_lock(Vec::new(), None);
+        tool.source = "node:cowsay".to_string();
+        let result = uninstall_node_package(&tool, "bun", &layout);
+        match old_path {
+            Some(p) => unsafe { std::env::set_var("PATH", p) },
+            None => unsafe { std::env::remove_var("PATH") },
+        }
+
+        result.expect("fake bun should exit 0");
+        let observed =
+            fs::read_to_string(&captured).expect("fake bun should have written the value");
+        assert_eq!(
+            observed.trim(),
+            layout
+                .prefix_bin_dir
+                .parent()
+                .expect("prefix_bin_dir has a parent")
+                .display()
+                .to_string()
+        );
     }
 
     #[test]

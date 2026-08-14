@@ -34,6 +34,7 @@ pub struct Config {
 #[serde(default)]
 pub struct Settings {
     pub prefix: String,
+    /// Max concurrent tools in `rig install`; `1` = strictly serial.
     pub parallel: u32,
 }
 

@@ -5,6 +5,7 @@ mod evalcache;
 mod initzsh;
 mod lock;
 mod paths;
+mod pool;
 mod remove;
 mod sources;
 mod update;
