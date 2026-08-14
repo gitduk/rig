@@ -19,5 +19,5 @@ if [[ ! -x $RIG_BIN ]]; then
 fi
 
 _rig=~/.local/share/rig/init.zsh
-[[ ! -f $_rig || ~/.config/rig/config.toml -nt $_rig || $commands[rig] -nt $_rig ]] && rig sync &>/dev/null
+[[ ! -f $_rig || ~/.rig.toml -nt $_rig || $commands[rig] -nt $_rig ]] && rig sync &>/dev/null
 source $_rig

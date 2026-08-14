@@ -41,7 +41,7 @@ impl Layout {
         let state_dir = home.join(".local/share/rig");
         let prefix_dir = expand_tilde_in(home, prefix);
         Self {
-            config_path: home.join(".config/rig/config.toml"),
+            config_path: home.join(".rig.toml"),
             lock_path: state_dir.join("rig.lock"),
             init_zsh_path: state_dir.join("init.zsh"),
             completions_dir: state_dir.join("completions"),
@@ -87,10 +87,7 @@ mod tests {
         let home = Path::new("/home/kaige");
         let layout = Layout::new(home, "~/.local");
 
-        assert_eq!(
-            layout.config_path,
-            PathBuf::from("/home/kaige/.config/rig/config.toml")
-        );
+        assert_eq!(layout.config_path, PathBuf::from("/home/kaige/.rig.toml"));
         assert_eq!(
             layout.lock_path,
             PathBuf::from("/home/kaige/.local/share/rig/rig.lock")

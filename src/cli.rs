@@ -121,7 +121,7 @@ struct Ctx {
 impl Ctx {
     fn load() -> anyhow::Result<Self> {
         let home = paths::home_dir()?;
-        let config_path = home.join(".config/rig/config.toml");
+        let config_path = home.join(".rig.toml");
         let config = config::load(&config_path)
             .with_context(|| format!("failed to load {}", config_path.display()))?;
         let layout = Layout::new(&home, &config.settings.prefix);

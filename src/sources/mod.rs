@@ -30,7 +30,7 @@ const USER_AGENT: &str = concat!("rig/", env!("CARGO_PKG_VERSION"));
 
 /// `Layout::new` hardcodes this same path unconditionally — no override
 /// mechanism exists, so error messages can name it as a literal.
-const CONFIG_PATH_HINT: &str = "~/.config/rig/config.toml";
+const CONFIG_PATH_HINT: &str = "~/.rig.toml";
 
 /// Shared by `git.rs` (post-clone, before symlinking) and `plugin.rs`
 /// (post-clone/pull, as the plugin's own version marker).
