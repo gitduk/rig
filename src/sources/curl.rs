@@ -1,7 +1,10 @@
 //! `[[curl]]`: installer scripts. No clean version concept exists for this
 //! source type (update reliability "depends on the script"), so `bins` are
 //! resolved the same way as `[[apt]]` — via PATH, after the script has done
-//! whatever placement it does on its own.
+//! whatever placement it does on its own. No script integrity check, by
+//! design: a hash pin breaks on every upstream roll and misses the binary
+//! (script downloads it itself). Guarantees: TLS (ureq default), and file
+//! execution from pkg/<tool>/install rather than `curl | sh`.
 
 use std::ffi::OsString;
 use std::fs;
@@ -16,9 +19,9 @@ use crate::config::CurlEntry;
 use crate::lock::ToolLock;
 use crate::paths::Layout;
 
-use super::{Phase, apply_env, collect_completions, resolve_declared_bins, run_setup, tool_key};
-
-const USER_AGENT: &str = concat!("rig/", env!("CARGO_PKG_VERSION"));
+use super::{
+    Phase, USER_AGENT, apply_env, collect_completions, resolve_declared_bins, run_setup, tool_key,
+};
 
 pub fn install(entry: &CurlEntry, layout: &Layout, phase: Phase) -> anyhow::Result<ToolLock> {
     let tool = tool_key(&entry.name);

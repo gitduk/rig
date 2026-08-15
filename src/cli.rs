@@ -6,7 +6,7 @@ use std::io::IsTerminal as _;
 use std::process::ExitCode;
 
 use anyhow::{Context as _, anyhow, bail};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
 use crate::config::{self, Config, ResolvedEntry};
 use crate::doctor;
@@ -62,13 +62,61 @@ enum Command {
 }
 
 pub fn run() -> ExitCode {
-    match dispatch(Cli::parse().command) {
+    let matches = build_command().get_matches();
+    let cli = match Cli::from_arg_matches(&matches) {
+        Ok(cli) => cli,
+        // Matches came from our own command, so this can't realistically
+        // fail — but let clap render/exit rather than unwrap.
+        Err(e) => e.exit(),
+    };
+    match dispatch(cli.command) {
         Ok(code) => code,
         Err(e) => {
             print_error(None, &e);
             ExitCode::FAILURE
         }
     }
+}
+
+/// clap 4.6 renders aliases only as trailing `[alias: i]`; hand-render the
+/// Commands block for cargo-style `install, i` (name/aliases stay intact).
+fn build_command() -> clap::Command {
+    let cmd = Cli::command();
+    let template = format!(
+        "{{about-with-newline}}\n{{usage-heading}} {{usage}}\n\n\
+         Commands:\n{}\n\nOptions:\n{{options}}",
+        render_commands(&cmd)
+    );
+    cmd.help_template(template)
+}
+
+/// One `name, alias  About` row per subcommand, name column padded. Appends the
+/// auto-generated `help` row, which isn't in the derived command until built.
+fn render_commands(cmd: &clap::Command) -> String {
+    let mut rows: Vec<(String, String)> = cmd
+        .get_subcommands()
+        .map(|sub| {
+            let mut name = sub.get_name().to_string();
+            for alias in sub.get_all_aliases() {
+                name.push_str(", ");
+                name.push_str(alias);
+            }
+            let about = sub.get_about().map(|a| a.to_string()).unwrap_or_default();
+            (name, about)
+        })
+        .collect();
+    if !rows.iter().any(|(n, _)| n == "help") {
+        rows.push((
+            "help".to_string(),
+            "Print this message or the help of the given subcommand(s)".to_string(),
+        ));
+    }
+
+    let width = rows.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
+    rows.iter()
+        .map(|(name, about)| format!("  {name:<width$}  {about}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Replaces anyhow's `{:?}` "Caused by:" chain — every `bail!` here is
@@ -148,10 +196,24 @@ impl Ctx {
     }
 }
 
+/// Commands that rewrite state serialize on a whole-command advisory lock;
+/// acquired before `Ctx::load` so the read-modify-write cycle is atomic
+/// against other rig processes. state_dir is prefix-independent, so no
+/// config is needed to find the lock file.
+fn state_lock_path() -> anyhow::Result<std::path::PathBuf> {
+    let home = paths::home_dir()?;
+    Ok(Layout::new(&home, "~").lock_file)
+}
+
+fn acquire_state_lock() -> anyhow::Result<lock::StateLock> {
+    lock::StateLock::acquire(&state_lock_path()?)
+}
+
 fn cmd_install(tools: Vec<String>) -> anyhow::Result<ExitCode> {
     if tools.is_empty() {
         bail!("specify at least one tool to install");
     }
+    let _state_lock = acquire_state_lock()?;
     let Ctx {
         config,
         mut lock,
@@ -303,6 +365,7 @@ fn install_entry(ctx: &mut Ctx, requested: &str) -> anyhow::Result<()> {
 }
 
 fn cmd_update(tools: Vec<String>, force: bool) -> anyhow::Result<ExitCode> {
+    let _state_lock = acquire_state_lock()?;
     let mut ctx = Ctx::load()?;
     let filter = (!tools.is_empty()).then_some(tools.as_slice());
     let reports = update::update_all(
@@ -358,6 +421,7 @@ fn cmd_remove(tools: Vec<String>) -> anyhow::Result<ExitCode> {
     if tools.is_empty() {
         bail!("specify at least one tool to remove");
     }
+    let _state_lock = acquire_state_lock()?;
     let mut ctx = Ctx::load()?;
 
     let mut failed = false;
@@ -415,6 +479,12 @@ fn cmd_list() -> anyhow::Result<()> {
 /// that are missing so their `source` line in init.zsh resolves. `--force`
 /// additionally re-probes every tool's `eval` cacheability in place.
 fn cmd_sync(force: bool) -> anyhow::Result<ExitCode> {
+    // Non-blocking: `rig sync` runs unattended on shell startup, so it skips
+    // rather than hang behind a slow install — the holder regenerates init.zsh.
+    let Some(_state_lock) = lock::StateLock::try_acquire(&state_lock_path()?)? else {
+        eprintln!("another rig process is running; skipping sync");
+        return Ok(ExitCode::SUCCESS);
+    };
     let mut ctx = Ctx::load()?;
 
     let mut failed = false;

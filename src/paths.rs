@@ -27,6 +27,8 @@ pub struct Layout {
     pub config_path: PathBuf,
     pub state_dir: PathBuf,
     pub lock_path: PathBuf,
+    /// Whole-command writer lock — see `lock::StateLock`.
+    pub lock_file: PathBuf,
     pub init_zsh_path: PathBuf,
     pub completions_dir: PathBuf,
     pub cache_dir: PathBuf,
@@ -37,12 +39,19 @@ pub struct Layout {
 }
 
 impl Layout {
+    /// `~/.local/share/rig` — independent of `prefix`, so the writer lock
+    /// can be acquired before the config is parsed.
+    pub fn state_dir(home: &Path) -> PathBuf {
+        home.join(".local/share/rig")
+    }
+
     pub fn new(home: &Path, prefix: &str) -> Self {
-        let state_dir = home.join(".local/share/rig");
+        let state_dir = Self::state_dir(home);
         let prefix_dir = expand_tilde_in(home, prefix);
         Self {
             config_path: home.join(".rig.toml"),
             lock_path: state_dir.join("rig.lock"),
+            lock_file: state_dir.join("rig.lock.lock"),
             init_zsh_path: state_dir.join("init.zsh"),
             completions_dir: state_dir.join("completions"),
             cache_dir: state_dir.join("cache"),

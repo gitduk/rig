@@ -15,6 +15,9 @@ pub struct Asset {
     pub name: String,
     pub url: String,
     pub size: u64,
+    /// `sha256:<hex>` when the host publishes it. Absent on old releases
+    /// and always on Codeberg (Gitea) — callers must degrade to size-only.
+    pub digest: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -28,6 +31,8 @@ struct AssetResponse {
     name: String,
     browser_download_url: String,
     size: u64,
+    #[serde(default)]
+    digest: Option<String>,
 }
 
 /// GitHub and Codeberg (Gitea) release APIs share this response shape.
@@ -48,6 +53,7 @@ pub fn latest_release(name: &str, host: Host) -> anyhow::Result<Release> {
                 name: a.name,
                 url: a.browser_download_url,
                 size: a.size,
+                digest: a.digest,
             })
             .collect(),
     })

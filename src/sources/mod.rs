@@ -13,12 +13,13 @@ pub mod repo;
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::{IsTerminal, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
 
 use anyhow::{Context, bail};
+use sha2::{Digest, Sha256};
 
 use crate::config::{BinSpec, BpickSpec, Common, CompletionsSpec, EvalSpec, SetupSpec};
 use crate::lock::Lock;
@@ -28,7 +29,9 @@ use crate::version::github::Asset;
 /// Re-exported: definition moved to `config.rs` (where `ResolvedEntry` also needs it).
 pub use crate::config::tool_key;
 
-const USER_AGENT: &str = concat!("rig/", env!("CARGO_PKG_VERSION"));
+/// Shared HTTP client identity — `curl.rs`, `version/*`, and `download`
+/// all speak for the same program.
+pub const USER_AGENT: &str = concat!("rig/", env!("CARGO_PKG_VERSION"));
 
 /// `Layout::new` hardcodes this same path unconditionally — no override
 /// mechanism exists, so error messages can name it as a literal.
@@ -219,7 +222,16 @@ pub fn glob_match(pattern: &str, name: &str) -> bool {
     true
 }
 
-pub fn download(url: &str, dest: &Path, expected_size: u64) -> anyhow::Result<()> {
+/// Downloads to `dest`, streaming through a sha256 while copying. Verifies
+/// `expected_size` always; when the host published a `digest`, the hash too
+/// — a mismatch means the asset was replaced upstream or corrupted in
+/// transit, not just truncated.
+pub fn download(
+    url: &str,
+    dest: &Path,
+    expected_size: u64,
+    digest: Option<&str>,
+) -> anyhow::Result<()> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -232,8 +244,22 @@ pub fn download(url: &str, dest: &Path, expected_size: u64) -> anyhow::Result<()
 
     let mut file =
         fs::File::create(dest).with_context(|| format!("failed to create {}", dest.display()))?;
-    let written = std::io::copy(&mut response.body_mut().as_reader(), &mut file)
-        .with_context(|| format!("failed to write {}", dest.display()))?;
+    let mut hasher = Sha256::new();
+    let mut reader = response.body_mut().as_reader();
+    let mut written = 0u64;
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = reader
+            .read(&mut buf)
+            .with_context(|| format!("failed to read from {url}"))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        file.write_all(&buf[..n])
+            .with_context(|| format!("failed to write {}", dest.display()))?;
+        written += n as u64;
+    }
 
     if written != expected_size {
         bail!(
@@ -241,7 +267,34 @@ pub fn download(url: &str, dest: &Path, expected_size: u64) -> anyhow::Result<()
              (truncated download or asset changed upstream)"
         );
     }
+    verify_digest(digest, &hasher.finalize()).with_context(|| {
+        format!(
+            "sha256 of {} doesn't match the release's digest",
+            dest.display()
+        )
+    })
+}
+
+/// `sha256:<hex>` is the only shape seen in the wild (GitHub emits it,
+/// Codeberg doesn't). Unknown algorithms degrade to size-only checking,
+/// matching the no-digest path — never hard-fail on a missing capability.
+fn verify_digest(digest: Option<&str>, actual: &[u8]) -> anyhow::Result<()> {
+    let Some(digest) = digest else {
+        return Ok(());
+    };
+    let Some(hex) = digest.strip_prefix("sha256:") else {
+        eprintln!("warning: unrecognized asset digest `{digest}`, skipping hash check");
+        return Ok(());
+    };
+    let actual_hex = to_hex(actual);
+    if !hex.eq_ignore_ascii_case(&actual_hex) {
+        bail!("expected {hex}, got {actual_hex}");
+    }
     Ok(())
+}
+
+fn to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Symlinks repoint only after success — clear any stale `final_dir`,
@@ -701,10 +754,23 @@ pub fn run_setup(
     }
 }
 
+/// `sudo` as a bare word or a `/sudo`-suffixed path, with shell wrapping
+/// (`(`/`$(`, `&&`/`|`/`;`) stripped — catches `command sudo`,
+/// `/usr/bin/sudo`, and sudo inside a subshell. False positives on `echo
+/// sudo` are acceptable: this is a warning, and misses are the real risk.
+fn mentions_sudo(cmd: &str) -> bool {
+    cmd.split_whitespace().any(|word| {
+        // Only shell-syntax characters get stripped: `/` and `-` survive so
+        // `/usr/bin/sudo` and `sudo -n` still match.
+        let bare = word.trim_matches(|c: char| !c.is_alphanumeric() && c != '/' && c != '-');
+        bare == "sudo" || bare.ends_with("/sudo")
+    })
+}
+
 /// Hooks that reach outside rig's control (via `sudo`) are allowed, but
 /// must not be silent about it.
 fn run_shell(cmd: &str, cwd: &Path, env: &HashMap<String, String>) -> anyhow::Result<()> {
-    if cmd.split_whitespace().any(|w| w == "sudo") {
+    if mentions_sudo(cmd) {
         eprintln!(
             "warning: setup hook runs `sudo` — writes outside rig's control, \
              uninstall will be incomplete: {cmd}"
@@ -917,6 +983,7 @@ mod tests {
             name: name.to_string(),
             url: format!("https://example.invalid/{name}"),
             size: 0,
+            digest: None,
         }
     }
 
@@ -1176,5 +1243,118 @@ mod tests {
             !new_final_dir.exists(),
             "finalize_partial must never have run"
         );
+    }
+
+    /// Serves `body` exactly once over HTTP on a loopback port, returning
+    /// the URL — enough surface for `download`'s size/digest checks.
+    fn serve_once(body: Vec<u8>) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().expect("test server addr");
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept test client");
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(head.as_bytes()).expect("write head");
+            stream.write_all(&body).expect("write body");
+        });
+        format!("http://{addr}/asset")
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        to_hex(&Sha256::digest(bytes))
+    }
+
+    #[test]
+    fn verify_digest_matches_and_degrades() {
+        let actual = Sha256::digest(b"payload");
+        let hex = to_hex(&actual);
+        verify_digest(Some(&format!("sha256:{hex}")), &actual).expect("matching hex passes");
+
+        let err = verify_digest(Some(&format!("sha256:{}", "0".repeat(64))), &actual)
+            .expect_err("mismatching hex must fail");
+        assert!(err.to_string().contains("expected"), "unexpected: {err}");
+
+        verify_digest(None, &actual).expect("missing digest passes");
+        verify_digest(Some("md5:beef"), &actual).expect("unknown algorithm degrades");
+    }
+
+    #[test]
+    fn download_accepts_a_matching_digest() {
+        let body = b"rig digest test payload".to_vec();
+        let url = serve_once(body.clone());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let digest = format!("sha256:{}", sha256_hex(&body));
+        download(
+            &url,
+            &tmp.path().join("asset"),
+            body.len() as u64,
+            Some(&digest),
+        )
+        .expect("matching digest must pass");
+    }
+
+    #[test]
+    fn download_rejects_a_mismatched_digest() {
+        let body = b"rig digest test payload".to_vec();
+        let url = serve_once(body.clone());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let digest = format!("sha256:{}", "0".repeat(64));
+        let err = download(
+            &url,
+            &tmp.path().join("asset"),
+            body.len() as u64,
+            Some(&digest),
+        )
+        .expect_err("wrong digest must fail");
+        assert!(err.to_string().contains("digest"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn download_without_digest_only_checks_size() {
+        let body = b"rig digest test payload".to_vec();
+        let url = serve_once(body.clone());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        download(&url, &tmp.path().join("asset"), body.len() as u64, None)
+            .expect("no digest must pass");
+    }
+
+    #[test]
+    fn download_degrades_on_unknown_digest_algorithm() {
+        let body = b"rig digest test payload".to_vec();
+        let url = serve_once(body.clone());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        download(
+            &url,
+            &tmp.path().join("asset"),
+            body.len() as u64,
+            Some("md5:beef"),
+        )
+        .expect("unknown algorithm degrades to size-only");
+    }
+
+    #[test]
+    fn download_still_fails_on_size_mismatch() {
+        let body = b"rig digest test payload".to_vec();
+        let url = serve_once(body.clone());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let err = download(&url, &tmp.path().join("asset"), body.len() as u64 + 1, None)
+            .expect_err("size mismatch must fail");
+        assert!(err.to_string().contains("expected"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn mentions_sudo_catches_paths_command_and_subshells() {
+        assert!(mentions_sudo("sudo apt install x"));
+        assert!(mentions_sudo("command sudo apt install x"));
+        assert!(mentions_sudo("/usr/bin/sudo apt install x"));
+        assert!(mentions_sudo("(sudo apt install x)"));
+        assert!(mentions_sudo("$(sudo apt install x)"));
+        assert!(mentions_sudo("echo hi && sudo make install"));
+        assert!(mentions_sudo("sudo; make install"));
+        assert!(mentions_sudo("make install && /usr/bin/sudo make install"));
+        assert!(!mentions_sudo("make install"));
+        assert!(!mentions_sudo("ls -la"));
     }
 }

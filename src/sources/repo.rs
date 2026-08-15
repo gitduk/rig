@@ -66,7 +66,7 @@ pub fn install(
 
     println!("  picked asset: {}", asset.name);
     let cache_path = layout.cache_dir.join(&asset.name);
-    download(&asset.url, &cache_path, asset.size)
+    download(&asset.url, &cache_path, asset.size, asset.digest.as_deref())
         .with_context(|| format!("failed to download {}", asset.name))?;
 
     let tool_dir = layout.tool_pkg_dir(tool);

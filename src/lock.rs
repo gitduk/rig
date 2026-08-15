@@ -5,9 +5,10 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -140,6 +141,71 @@ pub fn save_and_sync(config: &Config, lock: &Lock, layout: &Layout) -> anyhow::R
     atomic_write(&layout.init_zsh_path, &rendered)
 }
 
+/// Advisory cross-process lock on the state directory: held for a whole
+/// command so writers can't interleave and lose each other's `rig.lock` entries.
+pub struct StateLock {
+    _file: fs::File,
+}
+
+impl StateLock {
+    /// Blocks until the lock is free. For user-initiated writers where
+    /// silently skipping the write would be wrong.
+    pub fn acquire(path: &Path) -> anyhow::Result<Self> {
+        match Self::flock(path, false)? {
+            Some(lock) => Ok(lock),
+            // Unreachable: a blocking flock only returns on success or error.
+            None => bail!(
+                "blocking lock on {} returned without acquiring",
+                path.display()
+            ),
+        }
+    }
+
+    /// `Ok(None)` when another rig process holds the lock. Lets a
+    /// shell-startup `rig sync` bow out instead of hanging — the holder
+    /// regenerates init.zsh when it finishes, so nothing is lost.
+    pub fn try_acquire(path: &Path) -> anyhow::Result<Option<Self>> {
+        Self::flock(path, true)
+    }
+
+    fn flock(path: &Path, nonblocking: bool) -> anyhow::Result<Option<Self>> {
+        if let Some(parent) = path.parent() {
+            // First run has no state_dir yet; the lock file must exist
+            // before any writer can race on it.
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            // Only ever flock'd, never written — keep any existing content.
+            .truncate(false)
+            .open(path)
+            .with_context(|| format!("failed to open lock file {}", path.display()))?;
+
+        let op = if nonblocking {
+            libc::LOCK_EX | libc::LOCK_NB
+        } else {
+            libc::LOCK_EX
+        };
+        loop {
+            let rc = unsafe { libc::flock(file.as_raw_fd(), op) };
+            if rc == 0 {
+                return Ok(Some(Self { _file: file }));
+            }
+            let err = std::io::Error::last_os_error();
+            match err.raw_os_error() {
+                // A signal interrupted the blocking wait — retry, don't fail.
+                Some(code) if code == libc::EINTR => continue,
+                // Non-blocking and another process holds it — not an error.
+                Some(code) if nonblocking && code == libc::EWOULDBLOCK => return Ok(None),
+                _ => bail!("failed to lock {}: {err}", path.display()),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,6 +273,62 @@ mod tests {
     fn load_or_default_on_missing_file() {
         let lock = load_or_default(Path::new("/nonexistent/rig.lock")).expect("no error");
         assert!(lock.tool.is_empty());
+    }
+
+    #[test]
+    fn state_lock_creates_its_lock_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let lock_path = tmp.path().join("rig.lock.lock");
+        assert!(!lock_path.exists());
+
+        let _lock = StateLock::acquire(&lock_path).expect("acquire on a fresh state_dir");
+        assert!(lock_path.exists(), "lock file must be created");
+    }
+
+    #[test]
+    fn state_lock_blocks_a_second_opener_until_released() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let lock_path = tmp.path().join("rig.lock.lock");
+        let first = StateLock::acquire(&lock_path).expect("first opener");
+
+        // flock is per open-file-description, not per process: a second
+        // open + flock from another thread blocks like a second process.
+        let (tx, rx) = mpsc::channel();
+        let second_path = lock_path.clone();
+        let holder = std::thread::spawn(move || {
+            let start = Instant::now();
+            let _second = StateLock::acquire(&second_path).expect("second opener");
+            tx.send(start.elapsed()).expect("send elapsed");
+        });
+
+        std::thread::sleep(Duration::from_millis(200));
+        drop(first);
+        let waited = rx.recv().expect("second opener finished");
+        holder.join().expect("holder joined");
+
+        assert!(
+            waited >= Duration::from_millis(100),
+            "second opener must have blocked, waited {waited:?}"
+        );
+    }
+
+    #[test]
+    fn try_acquire_yields_none_while_held() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let lock_path = tmp.path().join("rig.lock.lock");
+
+        // Held for the whole test — its fd never closes, so a contending
+        // try_acquire deterministically sees EWOULDBLOCK, no fork-race flake.
+        let _held = StateLock::acquire(&lock_path).expect("first holder");
+        assert!(
+            StateLock::try_acquire(&lock_path)
+                .expect("try_acquire must not error")
+                .is_none(),
+            "try_acquire must yield None while the lock is held"
+        );
     }
 
     #[test]

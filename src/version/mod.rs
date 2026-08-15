@@ -8,7 +8,7 @@ pub mod npm;
 use anyhow::Context;
 use serde::de::DeserializeOwned;
 
-pub(super) const USER_AGENT: &str = concat!("rig/", env!("CARGO_PKG_VERSION"));
+use crate::sources::USER_AGENT;
 
 /// GET + parse, shared by all three version-lookup APIs — they differ only
 /// in the URL and the response type.
