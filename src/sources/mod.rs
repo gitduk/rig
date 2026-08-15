@@ -13,8 +13,10 @@ pub mod repo;
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
 
 use anyhow::{Context, bail};
 
@@ -506,25 +508,75 @@ pub fn collect_bins(
     for (cmd, source) in resolved {
         let link_source = rebase(&source, search_dir, link_root);
         let target = prefix_bin_dir.join(&cmd);
-        check_conflict(&target, lock)?;
+        check_conflict(&target, default_name, lock)?;
         symlink_replacing(&link_source, &target)?;
         installed.push((link_source, target));
     }
     Ok(installed)
 }
 
+/// Serializes overwrite prompts across pool workers so concurrent
+/// installs can't interleave stdin reads.
+static CONFIRM_GUARD: Mutex<()> = Mutex::new(());
+
+/// Prompts before deleting `target`. Refuses when stdin isn't a TTY so
+/// scripts/CI never hang; callers keep the old error path on refusal.
+fn confirm_overwrite(target: &Path) -> anyhow::Result<bool> {
+    let _guard = CONFIRM_GUARD.lock().expect("confirm guard poisoned");
+    if !std::io::stdin().is_terminal() {
+        return Ok(false);
+    }
+    print!(
+        "{} exists and isn't tracked by rig — delete it and let rig take over? [y/N] ",
+        target.display()
+    );
+    std::io::stdout()
+        .flush()
+        .context("failed to flush overwrite prompt")?;
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .context("failed to read confirmation")?;
+    Ok(answer_is_yes(&line))
+}
+
+fn answer_is_yes(line: &str) -> bool {
+    let answer = line.trim();
+    answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes")
+}
+
 /// A target that exists but isn't in `rig.lock` belongs to something
-/// else — refuse rather than clobber it.
-fn check_conflict(target: &Path, lock: &Lock) -> anyhow::Result<()> {
+/// else — ask before taking it over, refuse rather than clobber silently.
+/// Confirmation only grants permission; the delete happens at write time in
+/// `symlink_replacing`, so a later step failing never loses the original.
+fn check_conflict(target: &Path, tool: &str, lock: &Lock) -> anyhow::Result<()> {
     if !target.exists() {
         return Ok(());
     }
     let target_str = target.to_string_lossy();
-    let tracked = lock
-        .tool
-        .values()
-        .any(|t| t.bins.iter().any(|b| b == target_str.as_ref()));
-    if tracked {
+    let tracked = |key: &str| {
+        lock.tool
+            .get(key)
+            .is_some_and(|t| t.bins.iter().any(|b| b == target_str.as_ref()))
+    };
+    // Another rig tool's live bin — taking it over would silently rewire
+    // that tool's command, so refuse outright.
+    if let Some(owner) = lock.tool.keys().find(|k| *k != tool && tracked(k)) {
+        bail!(
+            "{} is installed by rig tool `{owner}` — refusing to overwrite another tool's bin",
+            target.display()
+        );
+    }
+    if tracked(tool) {
+        return Ok(()); // own stale bin: symlink_replacing refreshes it
+    }
+    if target.is_dir() {
+        bail!(
+            "{} is a directory and isn't tracked by rig.lock — remove it yourself, rig won't",
+            target.display()
+        );
+    }
+    if confirm_overwrite(target)? {
         return Ok(());
     }
     bail!(
@@ -534,9 +586,14 @@ fn check_conflict(target: &Path, lock: &Lock) -> anyhow::Result<()> {
 }
 
 fn symlink_replacing(source: &Path, target: &Path) -> anyhow::Result<()> {
-    if target.is_symlink() {
+    // Anything at `target` was vetted by check_conflict: rig's own stale
+    // symlink, or an untracked file the user confirmed. Remove only now,
+    // right before the new link lands, so an earlier step failing keeps
+    // the original intact. symlink_metadata (not exists) so broken links
+    // still count as present.
+    if fs::symlink_metadata(target).is_ok() {
         fs::remove_file(target)
-            .with_context(|| format!("failed to remove stale symlink {}", target.display()))?;
+            .with_context(|| format!("failed to remove stale {}", target.display()))?;
     }
     std::os::unix::fs::symlink(source, target).with_context(|| {
         format!(
@@ -934,6 +991,88 @@ mod tests {
 
         assert_eq!(installed.len(), 1);
         assert_eq!(installed[0].0, build_dir.join("wallust"));
+    }
+
+    #[test]
+    fn answer_is_yes_matches_y_and_yes_case_insensitively() {
+        for yes in ["y", "Y", "yes", "YES", "Yes", " y \n"] {
+            assert!(answer_is_yes(yes), "{yes:?} should confirm");
+        }
+        for no in ["n", "no", "N", "", "maybe", "yep"] {
+            assert!(!answer_is_yes(no), "{no:?} should not confirm");
+        }
+    }
+
+    #[test]
+    fn untracked_bin_conflict_still_refuses_when_stdin_is_not_a_tty() {
+        // `cargo test` inherits the terminal's stdin, where the prompt would
+        // block forever — only assert the refusal path when stdin is a pipe.
+        if std::io::stdin().is_terminal() {
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bin_dir = tmp.path().join("bin");
+        fs::create_dir_all(&bin_dir).expect("mkdir bin dir");
+        fs::write(bin_dir.join("zoxide"), b"manual install").expect("write decoy");
+
+        let lock = Lock::default();
+        let err = collect_bins(
+            tmp.path(),
+            tmp.path(),
+            Some(&BinSpec::Single("zoxide".to_string())),
+            "zoxide",
+            &bin_dir,
+            &lock,
+        )
+        .expect_err("untracked conflict must fail");
+
+        assert!(
+            err.to_string().contains("refusing to overwrite"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            bin_dir.join("zoxide").exists(),
+            "decoy must survive a refusal"
+        );
+    }
+
+    #[test]
+    fn refuses_overwriting_a_bin_tracked_by_another_tool() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let target = tmp.path().join("bin").join("foo");
+        fs::create_dir_all(target.parent().expect("parent")).expect("mkdir bin dir");
+        fs::write(&target, b"live bin").expect("write bin");
+
+        let mut lock = Lock::default();
+        let mut other = crate::lock::test_tool_lock();
+        other.bins = vec![target.display().to_string()];
+        lock.tool.insert("other".to_string(), other);
+
+        let err = check_conflict(&target, "me", &lock)
+            .expect_err("another tool's tracked bin must be refused");
+        assert!(
+            err.to_string().contains("another tool's bin"),
+            "unexpected error: {err}"
+        );
+        assert!(target.exists(), "refusal must leave the bin alone");
+    }
+
+    #[test]
+    fn own_tracked_bin_passes_without_deleting() {
+        // Deleting is deferred to symlink_replacing, so check_conflict must
+        // return Ok while leaving the (stale) symlink in place.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let target = tmp.path().join("bin").join("foo");
+        fs::create_dir_all(target.parent().expect("parent")).expect("mkdir bin dir");
+        fs::write(&target, b"stale").expect("write stale bin");
+
+        let mut lock = Lock::default();
+        let mut mine = crate::lock::test_tool_lock();
+        mine.bins = vec![target.display().to_string()];
+        lock.tool.insert("me".to_string(), mine);
+
+        check_conflict(&target, "me", &lock).expect("own stale bin should pass");
+        assert!(target.exists(), "check_conflict must not delete");
     }
 
     #[test]

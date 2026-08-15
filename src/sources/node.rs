@@ -170,8 +170,11 @@ fn install_via_bun(
 
     // Bun writes into rig's shared prefix_bin_dir, so it needs the same
     // untracked-conflict guard collect_bins gives every other source.
+    // Deletion is deferred: bun itself replaces the target, and a failed
+    // `bun install` must leave the original file untouched.
+    let key = tool_key(&entry.name);
     for name in bin_names {
-        super::check_conflict(&layout.prefix_bin_dir.join(name), lock)?;
+        super::check_conflict(&layout.prefix_bin_dir.join(name), key, lock)?;
     }
 
     let mut command = Command::new("bun");
@@ -209,7 +212,7 @@ fn install_via_npm(
     let bin_dir = npm_prefix.join("bin");
 
     for name in bin_names {
-        super::check_conflict(&bin_dir.join(name), lock)?;
+        super::check_conflict(&bin_dir.join(name), tool_key(&entry.name), lock)?;
     }
 
     let mut command = Command::new("npm");
