@@ -260,7 +260,7 @@ pub enum NodeManager {
     Npm,
 }
 
-/// `[[apt]]`: system package, left to `apt upgrade` for updates.
+/// `[[apt]]`: system package via apt-get; `rig update` reruns the install (no version pre-check).
 #[derive(Debug, Deserialize)]
 pub struct AptEntry {
     pub name: String,

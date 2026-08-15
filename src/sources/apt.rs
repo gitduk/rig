@@ -1,7 +1,8 @@
-//! `[[apt]]`: system packages via `apt-get`. Updates are left to `apt
-//! upgrade` — rig only handles the initial install. dpkg owns file
-//! placement system-wide, so there's no `pkg/<tool>/<version>` tree here
-//! and no symlinks for rig to create; it just records what dpkg reports.
+//! `[[apt]]`: system packages via `apt-get`. `rig update` reruns the
+//! install (no cheap version pre-check — apt itself is the version
+//! source). dpkg owns file placement system-wide, so there's no
+//! `pkg/<tool>/<version>` tree here and no symlinks for rig to create; it
+//! just records what dpkg reports.
 
 use std::process::Command;
 
