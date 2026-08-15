@@ -3,44 +3,43 @@ name: release
 on:
   push:
     branches: [master]
-    tags: ["v*"]
+    paths: [Cargo.toml]
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  # Branch pushes: tag Cargo.toml's version if the tag is missing, then let
-  # build publish in the same run. Manual `git tag && git push origin <tag>`
-  # keeps working — tag pushes skip this job and go straight to build.
-  # Auto-tags can't rely on the tag push triggering a second run: pushes made
-  # with GITHUB_TOKEN don't create new workflow runs.
+  # Cargo.toml's version is the single source of truth: tag it when the tag
+  # is missing, then publish in the same run. Auto-tags can't rely on the
+  # tag push triggering a second run — pushes made with GITHUB_TOKEN don't
+  # create new workflow runs.
   tag:
-    if: github.ref_type == 'branch'
     runs-on: ubuntu-latest
     outputs:
-      tagged: ${{ steps.tag.outputs.tagged }}
-      tag: ${{ steps.tag.outputs.tag }}
+      version: ${{ steps.tag.outputs.version }}
+      created: ${{ steps.tag.outputs.created }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
       - id: tag
-        name: Tag Cargo.toml version if missing
+        name: Create tag if not exists
         run: |
-          tag="v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
-          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
-            echo "tag $tag already exists, skipping"
-            echo "tagged=false" >> "$GITHUB_OUTPUT"
+          VERSION="v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if git ls-remote --tags origin "$VERSION" | grep -q .; then
+            echo "Tag $VERSION already exists, skipping."
+            echo "created=false" >> "$GITHUB_OUTPUT"
           else
-            git tag "$tag"
-            git push origin "$tag"
-            echo "tagged=true" >> "$GITHUB_OUTPUT"
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git tag -a "$VERSION" -m "Release $VERSION"
+            git push origin "$VERSION"
+            echo "created=true" >> "$GITHUB_OUTPUT"
           fi
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
   build:
     needs: tag
-    if: github.ref_type == 'tag' || needs.tag.outputs.tagged == 'true'
+    if: needs.tag.outputs.created == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -52,5 +51,6 @@ jobs:
           cp rig.zsh dist/rig.zsh
       - uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || needs.tag.outputs.tag }}
+          tag_name: ${{ needs.tag.outputs.version }}
+          generate_release_notes: true
           files: dist/*
