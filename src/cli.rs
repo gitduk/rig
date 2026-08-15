@@ -250,36 +250,45 @@ fn cmd_install(tools: Vec<String>) -> anyhow::Result<ExitCode> {
         workers,
         |name| install_one(&config, &lock_snapshot, &layout, name),
         |name, result| match result {
-            Ok((key, Some(tool_lock))) => {
-                if lock.tool.contains_key(&key) {
-                    return; // a racing install of the same key won
-                }
-                let version = tool_lock.version.clone();
-                lock.tool.insert(key.clone(), tool_lock);
-                if let Err(e) = lock::save_and_sync(&config, &lock, &layout) {
-                    failed = true;
-                    print_error(Some(&name), &e);
-                } else {
-                    println!("installed {key} {version}");
-                }
-            }
-            Ok((key, None)) => {
-                // A `None` result means the tool was healthy in the
-                // batch-start snapshot; the merged lock only grows from
-                // there, so the entry is guaranteed present.
-                let existing = lock
-                    .tool
-                    .get(&key)
-                    .expect("a healthy tool's lock entry can't vanish mid-batch");
-                println!(
-                    "{key} is already installed ({}) — use `rig update {key}` to check \
-                     for a newer version, or `rig remove {key}` first to force a clean reinstall",
-                    existing.version
-                );
-            }
             Err(e) => {
                 failed = true;
                 print_error(Some(&name), &e);
+            }
+            Ok((key, outcome)) => {
+                let persisted = match outcome {
+                    InstallOutcome::AlreadyCurrent => None,
+                    InstallOutcome::Installed(new) => {
+                        let v = new.version.clone();
+                        Some((new, format!("installed {key} {v}")))
+                    }
+                    InstallOutcome::Updated { from, lock: new } => {
+                        let v = new.version.clone();
+                        Some((new, format!("updated {key} {from} -> {v}")))
+                    }
+                };
+                match persisted {
+                    None => {
+                        // Healthy, update check found nothing newer. The merged
+                        // lock only grows from the snapshot, so the entry exists.
+                        let existing = lock
+                            .tool
+                            .get(&key)
+                            .expect("a healthy tool's lock entry can't vanish mid-batch");
+                        println!(
+                            "{key} is already installed and up to date ({})",
+                            existing.version
+                        );
+                    }
+                    Some((entry, message)) => {
+                        lock.tool.insert(key.clone(), entry);
+                        if let Err(e) = lock::save_and_sync(&config, &lock, &layout) {
+                            failed = true;
+                            print_error(Some(&name), &e);
+                        } else {
+                            println!("{message}");
+                        }
+                    }
+                }
             }
         },
     );
@@ -291,15 +300,25 @@ fn cmd_install(tools: Vec<String>) -> anyhow::Result<ExitCode> {
     })
 }
 
-/// Installs one tool, returning `(key, Option<ToolLock>)` — `None` when the
-/// tool was already healthy at batch start. Pure: reads `config`/`lock`/
-/// `layout`, never mutates them; the caller merges and persists.
+/// The three ways installing one tool can resolve — distinct because
+/// `rig install` folds in an update check for an already-installed tool.
+enum InstallOutcome {
+    /// Freshly installed, or repaired from a dangling/unhealthy state.
+    Installed(ToolLock),
+    /// Was already installed; a newer version replaced it.
+    Updated { from: String, lock: ToolLock },
+    /// Already installed and already the latest.
+    AlreadyCurrent,
+}
+
+/// Installs one tool. Pure: reads `config`/`lock`/`layout`, never mutates
+/// them; the caller merges the returned lock (if any) and persists.
 fn install_one(
     config: &Config,
     lock: &Lock,
     layout: &Layout,
     requested: &str,
-) -> anyhow::Result<(String, Option<ToolLock>)> {
+) -> anyhow::Result<(String, InstallOutcome)> {
     let resolved = config::resolve_tool(config, requested)
         .ok_or_else(|| anyhow!("{requested} is not in config.toml"))?;
     let key = resolved.key();
@@ -322,7 +341,14 @@ fn install_one(
             }
         };
         if healthy {
-            return Ok((key, None));
+            // Already installed — fold in an update check so `rig install`
+            // also pulls a newer version when one exists (`rig update` flow).
+            let from = existing.version.clone();
+            let outcome = match update::check_and_update(config, lock, layout, requested)? {
+                Some(new) => InstallOutcome::Updated { from, lock: new },
+                None => InstallOutcome::AlreadyCurrent,
+            };
+            return Ok((key, outcome));
         }
     }
 
@@ -337,31 +363,37 @@ fn install_one(
         ResolvedEntry::Curl(e) => sources::curl::install(e, layout, sources::Phase::Install)?,
         ResolvedEntry::Plugin(e) => sources::plugin::install(e, layout)?,
     };
-    Ok((key, Some(new_lock)))
+    Ok((key, InstallOutcome::Installed(new_lock)))
 }
 
 /// Serial wrapper for callers that need the lock merged immediately
 /// (`cmd_sync`'s plugin backfill) — same semantics as `install_one` + merge.
 fn install_entry(ctx: &mut Ctx, requested: &str) -> anyhow::Result<()> {
     match install_one(&ctx.config, &ctx.lock, &ctx.layout, requested)? {
-        (key, Some(tool_lock)) => {
+        (key, InstallOutcome::Installed(tool_lock)) => {
             println!("installed {key} {}", tool_lock.version);
             ctx.lock.tool.insert(key, tool_lock);
-            Ok(())
         }
-        (key, None) => {
-            // install_one no longer prints the skip notice — restore the
-            // serial behavior for callers that hit an already-healthy tool.
+        (
+            key,
+            InstallOutcome::Updated {
+                from,
+                lock: tool_lock,
+            },
+        ) => {
+            println!("updated {key} {from} -> {}", tool_lock.version);
+            ctx.lock.tool.insert(key, tool_lock);
+        }
+        (key, InstallOutcome::AlreadyCurrent) => {
             if let Some(existing) = ctx.lock.tool.get(&key) {
                 println!(
-                    "{key} is already installed ({}) — use `rig update {key}` to check \
-                     for a newer version, or `rig remove {key}` first to force a clean reinstall",
+                    "{key} is already installed and up to date ({})",
                     existing.version
                 );
             }
-            Ok(())
         }
     }
+    Ok(())
 }
 
 fn cmd_update(tools: Vec<String>, force: bool) -> anyhow::Result<ExitCode> {

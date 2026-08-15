@@ -173,6 +173,20 @@ fn update_one(
     }
 }
 
+/// Folds an update check into `rig install` for an already-installed tool:
+/// `Some(new)` if the source reinstalled (newer version / curl), else `None`.
+pub fn check_and_update(
+    config: &Config,
+    lock: &Lock,
+    layout: &Layout,
+    name: &str,
+) -> anyhow::Result<Option<ToolLock>> {
+    match update_one(config, lock, layout, name, false, false)? {
+        (_, Some(LockChange::Replace(new))) => Ok(Some(*new)),
+        _ => Ok(None),
+    }
+}
+
 /// Re-probes `eval` and returns the patch, unlike a real update: version,
 /// bins, and completions are left untouched. `apply_change` does the write.
 fn refresh_eval_cache(
