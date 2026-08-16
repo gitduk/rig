@@ -97,12 +97,19 @@ pub fn load_or_default(path: &Path) -> anyhow::Result<Lock> {
 
 /// `fs::write` truncates in place, so a disk-full write can destroy the
 /// old content before the new content lands. Temp file + `rename` instead.
-fn atomic_write(path: &Path, contents: &str) -> anyhow::Result<()> {
+/// Idempotent: identical content skips the rewrite, so a shell-startup
+/// `rig sync` (and `--self`'s bootstrap refresh) that finds nothing to
+/// change costs no disk churn. `pub` because `self_update` reuses it for
+/// `rig.zsh`.
+pub fn atomic_write(path: &Path, contents: &str) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
     if path.exists() {
+        if fs::read_to_string(path).is_ok_and(|existing| existing == contents) {
+            return Ok(());
+        }
         let backup = backup_path(path);
         fs::copy(path, &backup).with_context(|| {
             format!(
@@ -344,6 +351,47 @@ mod tests {
 
         assert!(layout.lock_path.exists());
         assert!(layout.init_zsh_path.exists());
+    }
+
+    #[test]
+    fn atomic_write_skips_rewrite_when_content_matches() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("file");
+        let backup = tmp.path().join(".file");
+
+        atomic_write(&path, "v1").expect("first write");
+        let mtime = fs::metadata(&path)
+            .expect("metadata")
+            .modified()
+            .expect("mtime");
+        atomic_write(&path, "v1").expect("identical write");
+
+        assert!(
+            !backup.exists(),
+            "an identical write must not churn the backup generation"
+        );
+        assert_eq!(
+            fs::metadata(&path)
+                .expect("metadata")
+                .modified()
+                .expect("mtime"),
+            mtime,
+            "identical content must not rewrite the file"
+        );
+        assert_eq!(fs::read_to_string(&path).expect("read"), "v1");
+    }
+
+    #[test]
+    fn atomic_write_backs_up_only_when_content_changes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("file");
+        let backup = tmp.path().join(".file");
+
+        atomic_write(&path, "v1").expect("first write");
+        atomic_write(&path, "v2").expect("changed write");
+
+        assert_eq!(fs::read_to_string(&backup).expect("backup"), "v1");
+        assert_eq!(fs::read_to_string(&path).expect("read"), "v2");
     }
 
     #[test]

@@ -7,6 +7,7 @@ mod lock;
 mod paths;
 mod pool;
 mod remove;
+mod self_update;
 mod sources;
 mod update;
 mod version;

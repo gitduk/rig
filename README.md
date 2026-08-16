@@ -25,7 +25,7 @@ on the spot via `command_not_found_handler`.
   optionally bound to a ZLE widget key.
 - **Atomic updates** — each version lives in its own `pkg/<tool>/<version>/`
   dir; symlinks repoint only after the new build succeeds, and `rig.lock`
-  writes are temp-file + rename.
+  writes are temp-file + rename, skipped entirely when content is unchanged.
 - **Parallel installs** — `settings.parallel` workers with a whole-command
   advisory lock.
 - **`rig doctor`** — surfaces config/shell drift (PATH ordering, dangling
@@ -46,8 +46,14 @@ source $_rig_zsh
 ```
 
 On first login the bootstrap downloads the `rig` binary, runs `rig sync`,
-and generates `init.zsh`. Subsequent shells only re-sync when the config
-or binary is newer.
+and generates `init.zsh`. Every subsequent shell runs `rig sync`
+unconditionally — the bootstrap is a thin shell that never needs updating,
+and both `init.zsh` and `rig.lock` rewrites are skipped when the content is
+unchanged, so a no-op sync costs a few milliseconds of fork, not a rewrite.
+
+rig manages its own lifecycle: `rig update --self` replaces the binary and
+refreshes the bootstrap from the latest release, so no `[[repo]]` entry for
+rig itself is needed (or wanted) in `~/.rig.toml`.
 
 Prefer building from source (edition 2024, needs a recent Rust toolchain):
 
@@ -132,7 +138,7 @@ share these fields (plus their own: `host`/`bpick`/`extract` on `[[repo]]`,
 | Command | Alias | Description |
 | --- | --- | --- |
 | `rig install <tool...>` | `i` | Install tools (folds in an update check for already-installed ones). |
-| `rig update [tool...]` | `u` | Update everything, or just the named tools. `--force` reinstalls. |
+| `rig update [tool...]` | `u` | Update everything, or just the named tools. `--force` reinstalls. `--self` updates rig itself (binary + bootstrap), no config entry needed. |
 | `rig remove <tool...>` | `rm` | Remove a tool's rig-owned files and lock entry. |
 | `rig list` | `ls` | Configured tools, marked installed/not. |
 | `rig sync [--force]` | `s` | Regenerate `init.zsh` from the config; clones missing plugins. `--force` re-probes every tool's eval cacheability. |

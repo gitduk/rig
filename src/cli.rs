@@ -36,6 +36,9 @@ enum Command {
         tools: Vec<String>,
         #[arg(long)]
         force: bool,
+        /// Update rig itself (binary + bootstrap) instead of configured tools
+        #[arg(long = "self", conflicts_with = "tools")]
+        self_update: bool,
     },
     /// Remove an installed tool's rig-owned files
     #[command(visible_alias = "rm")]
@@ -157,7 +160,16 @@ fn print_error(prefix: Option<&str>, err: &anyhow::Error) {
 fn dispatch(command: Command) -> anyhow::Result<ExitCode> {
     match command {
         Command::Install { tools } => cmd_install(tools),
-        Command::Update { tools, force } => cmd_update(tools, force),
+        Command::Update {
+            self_update: true,
+            force,
+            ..
+        } => cmd_self_update(force),
+        Command::Update {
+            tools,
+            force,
+            self_update: false,
+        } => cmd_update(tools, force),
         Command::Remove { tools } => cmd_remove(tools),
         Command::List => cmd_list().map(|()| ExitCode::SUCCESS),
         Command::Sync { force } => cmd_sync(force),
@@ -396,6 +408,29 @@ fn install_entry(ctx: &mut Ctx, requested: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `rig update --self` — rig manages its own binary and bootstrap, no
+/// config entry needed. Version comes from the build, not `rig.lock`.
+fn cmd_self_update(force: bool) -> anyhow::Result<ExitCode> {
+    let _state_lock = acquire_state_lock()?;
+    let mut ctx = Ctx::load()?;
+    // A `[[repo]] gitduk/rig` entry left over from before self-management
+    // still works (`rig update rig` runs the repo flow) but is redundant.
+    if config::resolve_tool(&ctx.config, "rig").is_some() {
+        eprintln!(
+            "note: the `[[repo]] gitduk/rig` config entry is redundant — \
+             rig updates itself via `rig update --self`; you can remove it"
+        );
+    }
+    let outcome = crate::self_update::update_self(force, &ctx.layout, &mut ctx.lock)?;
+    if matches!(outcome, update::Outcome::Updated { .. }) {
+        // Persists the retired `rig.lock` entry; init.zsh rewrite is
+        // skipped when nothing changed.
+        ctx.save()?;
+    }
+    println!("rig: {}", describe_outcome(&outcome));
+    Ok(ExitCode::SUCCESS)
+}
+
 fn cmd_update(tools: Vec<String>, force: bool) -> anyhow::Result<ExitCode> {
     let _state_lock = acquire_state_lock()?;
     let mut ctx = Ctx::load()?;
@@ -592,7 +627,9 @@ fn write_own_completions(layout: &Layout) -> anyhow::Result<()> {
     fs::create_dir_all(&layout.completions_dir)
         .with_context(|| format!("failed to create {}", layout.completions_dir.display()))?;
     let dest = layout.completions_dir.join("_rig");
-    fs::write(&dest, buf).with_context(|| format!("failed to write {}", dest.display()))
+    let contents = String::from_utf8_lossy(&buf);
+    lock::atomic_write(&dest, &contents)
+        .with_context(|| format!("failed to write {}", dest.display()))
 }
 
 /// `rig sync` can fire unattended on shell startup — this is the only

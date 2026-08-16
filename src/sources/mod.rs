@@ -505,12 +505,19 @@ pub fn smoke_test_version(
         .into_iter()
         .next()
         .context("no bin resolved to smoke-test")?;
-    let status = Command::new(&path)
+    run_version_smoke(&path, &name)
+}
+
+/// Shared `--version` gate for freshly built/downloaded bins: a build that
+/// can't even print its version must never go live. Used by the repo flow
+/// and `rig update --self`'s raw-binary swap.
+pub fn run_version_smoke(bin: &Path, label: &str) -> anyhow::Result<()> {
+    let status = Command::new(bin)
         .arg("--version")
         .status()
-        .with_context(|| format!("failed to run `{name} --version`"))?;
+        .with_context(|| format!("failed to run `{label} --version`"))?;
     if !status.success() {
-        bail!("`{name} --version` exited with {status} — refusing to make this build live");
+        bail!("`{label} --version` exited with {status} — refusing to make this build live");
     }
     Ok(())
 }

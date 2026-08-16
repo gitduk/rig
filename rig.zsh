@@ -18,6 +18,9 @@ if [[ ! -x $RIG_BIN ]]; then
     && chmod +x $RIG_BIN
 fi
 
-_rig=~/.local/share/rig/init.zsh
-[[ ! -f $_rig || ~/.rig.toml -nt $_rig || $commands[rig] -nt $_rig ]] && rig sync &>/dev/null
-source $_rig
+# Unconditional sync: the bootstrap stays a thin shell that never needs
+# updating, so every version-dependent decision (config path, staleness)
+# lives in the rig binary. `atomic_write` is idempotent, so a no-op sync
+# costs a few ms of fork, not an init.zsh rewrite.
+[[ -x $RIG_BIN ]] && rig sync &>/dev/null
+source ~/.local/share/rig/init.zsh
