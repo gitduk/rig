@@ -138,7 +138,7 @@ share these fields (plus their own: `host`/`bpick`/`extract` on `[[repo]]`,
 | Command | Alias | Description |
 | --- | --- | --- |
 | `rig install <tool...>` | `i` | Install tools (folds in an update check for already-installed ones). |
-| `rig update [tool...]` | `u` | Update everything, or just the named tools. `--force` reinstalls. `--self` updates rig itself (binary + bootstrap), no config entry needed. |
+| `rig update [tool...]` | `u` | Update everything, or just the named tools. `-f`/`--force` reinstalls. `--self` updates rig itself (binary + bootstrap), no config entry needed. |
 | `rig remove <tool...>` | `rm` | Remove a tool's rig-owned files and lock entry. |
 | `rig list` | `ls` | Configured tools, marked installed/not. |
 | `rig sync [--force]` | `s` | Regenerate `init.zsh` from the config; clones missing plugins. `--force` re-probes every tool's eval cacheability. |

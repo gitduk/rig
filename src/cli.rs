@@ -34,7 +34,7 @@ enum Command {
     #[command(visible_alias = "u")]
     Update {
         tools: Vec<String>,
-        #[arg(long)]
+        #[arg(short, long)]
         force: bool,
         /// Update rig itself (binary + bootstrap) instead of configured tools
         #[arg(long = "self", conflicts_with = "tools")]
