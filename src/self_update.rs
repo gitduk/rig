@@ -5,6 +5,8 @@
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+use std::process::Command;
 
 use anyhow::{Context, anyhow, bail};
 
@@ -22,9 +24,32 @@ const SELF_ASSET: &str = "rig-x86_64-unknown-linux-gnu";
 const BOOTSTRAP_ASSET: &str = "rig.zsh";
 
 /// The build's own version, prefixed like a release tag (`v0.9.0`) so it
-/// compares directly against `Release.tag`.
+/// compares directly against `Release.tag`. Fallback only, for when the
+/// installed binary can't be interrogated.
 fn local_version() -> String {
     format!("v{}", env!("CARGO_PKG_VERSION"))
+}
+
+/// Version of the binary `update_self` will replace, so a locally-built
+/// rig (e.g. `./target/release/rig update --self`) can't report itself
+/// up to date while the installed rig lags behind.
+fn installed_version(bin: &Path) -> Option<String> {
+    let out = Command::new(bin).arg("--version").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_version(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Last whitespace token of a `rig --version` line, v-prefixed like a
+/// release tag so `version_tuple` can compare it directly.
+fn parse_version(output: &str) -> Option<String> {
+    let version = output.split_whitespace().last()?;
+    Some(if version.starts_with('v') {
+        version.to_string()
+    } else {
+        format!("v{version}")
+    })
 }
 
 /// `v0.9.0` -> `(0, 9, 0)`. Malformed tags degrade to zero so a weird
@@ -75,8 +100,9 @@ pub fn update_self(force: bool, layout: &Layout, lock: &mut Lock) -> anyhow::Res
 
     let release = github::latest_release("gitduk/rig", Host::Github)
         .context("failed to resolve the latest rig release")?;
-    let from = local_version();
-    // A local build newer than the latest release (e.g. cargo-installed
+    let live = layout.prefix_bin_dir.join("rig");
+    let from = installed_version(&live).unwrap_or_else(local_version);
+    // An installed build newer than the latest release (e.g. cargo-installed
     // master) must never be downgraded by `--self`.
     if !force && version_tuple(&from) >= version_tuple(&release.tag) {
         return Ok(Outcome::UpToDate { version: from });
@@ -88,7 +114,6 @@ pub fn update_self(force: bool, layout: &Layout, lock: &mut Lock) -> anyhow::Res
     // live, so a network failure leaves the current rig fully intact.
     // Same directory as the live binary keeps the final rename on one
     // filesystem; overwriting a running binary is safe on Unix.
-    let live = layout.prefix_bin_dir.join("rig");
     let tmp_bin = layout.prefix_bin_dir.join(".rig-self-update");
     println!("  downloading {SELF_ASSET}");
     sources::download(
@@ -152,6 +177,13 @@ mod tests {
     #[test]
     fn local_version_is_v_prefixed() {
         assert_eq!(local_version(), format!("v{}", env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn installed_version_parses_rig_output() {
+        assert_eq!(parse_version("rig 0.10.0\n"), Some("v0.10.0".to_string()));
+        assert_eq!(parse_version("rig v0.9.0\n"), Some("v0.9.0".to_string()));
+        assert_eq!(parse_version(""), None);
     }
 
     #[test]
