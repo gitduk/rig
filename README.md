@@ -112,7 +112,7 @@ run = "_zsh_autosuggest_start"
 | `[[cargo]]` | `cargo install` | crates.io |
 | `[[node]]` | `bun add -g` / `npm i -g` (`manager = auto` probes bun first) | npm registry |
 | `[[apt]]` | `apt-get install`; rig records the dpkg-reported version and where the bin landed | no pre-check — `rig update` reruns `apt-get install`, reports up to date when the version didn't change |
-| `[[curl]]` | Fetches `url` and runs it as a script | none — rerun every `rig update` |
+| `[[curl]]` | Fetches `url` and runs it as a script | none — skipped by blanket `rig update`; reruns only when named explicitly (`rig update <tool>`) |
 | `[[plugin]]` | Clones to `~/.local/share/rig/plugins/`; zsh `source`s `source` and runs `run` right after | git pull |
 
 ### Shared fields
@@ -138,7 +138,7 @@ share these fields (plus their own: `host`/`bpick`/`extract` on `[[repo]]`,
 | Command | Alias | Description |
 | --- | --- | --- |
 | `rig install <tool...>` | `i` | Install tools (folds in an update check for already-installed ones). |
-| `rig update [tool...]` | `u` | Update everything, or just the named tools. `-f`/`--force` reinstalls. `--self` updates rig itself (binary + bootstrap), no config entry needed. |
+| `rig update [tool...]` | `u` | Update everything, or just the named tools. Unfiltered runs skip `[[curl]]` tools — their scripts rerun only when named. `-f`/`--force` reinstalls. `--self` updates rig itself (binary + bootstrap), no config entry needed. |
 | `rig remove <tool...>` | `rm` | Remove a tool's rig-owned files and lock entry. |
 | `rig list` | `ls` | Configured tools, marked installed/not. |
 | `rig sync [--force]` | `s` | Regenerate `init.zsh` from the config; clones missing plugins. `--force` re-probes every tool's eval cacheability. |

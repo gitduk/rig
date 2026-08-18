@@ -1,6 +1,8 @@
 //! Update flow, reusing each source type's `sources::*::install`.
 //! repo/git/cargo/node check a cheap version query against `rig.lock`
-//! first; apt/curl have no such pre-check and just always reinstall.
+//! first and skip when current; apt always reinstalls (a no-op when
+//! current) and diffs the version; curl always reruns, so an unfiltered
+//! `rig update` skips it — only `rig update <tool>` reaches it.
 
 use anyhow::{anyhow, bail};
 
@@ -25,6 +27,8 @@ pub enum Outcome {
     },
     /// `[[curl]]`: no version to compare (reliability "depends on the
     /// script"), so every call reruns it rather than guessing staleness.
+    /// Blanket `rig update` keeps curl out; this only fires on an
+    /// explicit `rig update <tool>` or `rig install`'s folded check.
     Reran,
     /// `rig sync --force`: `eval` was re-probed in place, version untouched.
     EvalRefreshed {
@@ -85,13 +89,19 @@ pub fn update_all(
     filter: Option<&[String]>,
 ) -> Vec<Report> {
     let wanted = |key: &str| filter.is_none_or(|names| names.iter().any(|n| n == key));
+    // Curl has no cheap staleness check, so an unfiltered `rig update`
+    // would rerun every curl script each time; it only updates when named
+    // explicitly (`rig update <tool>`) or via `rig install`'s folded
+    // check. apt stays in the blanket run — its reinstall is a no-op when
+    // the version is unchanged.
+    let blanket = filter.is_none();
     // Collect (key, full name): the key feeds the report, but `resolve_tool`
     // is only unambiguous on the full name — two entries can share a key
     // (e.g. `foo/bar` and `baz/bar` both key as `bar`), and resolving by
     // key would silently pick the first one for both.
     let targets: Vec<(String, String)> = config::all_entries(config)
         .into_iter()
-        .filter(|e| wanted(&e.key()))
+        .filter(|e| wanted(&e.key()) && !(blanket && matches!(e, ResolvedEntry::Curl(_))))
         .map(|e| (e.key(), e.name().to_string()))
         .collect();
     let workers = config.settings.parallel as usize;
@@ -379,6 +389,9 @@ fn update_apt(
     ))
 }
 
+/// No cheap pre-check exists, so it always reruns the script; `update_all`
+/// keeps curl out of blanket runs, so this fires only on an explicit
+/// `rig update <tool>` (or the update check folded into `rig install`).
 fn update_curl(
     entry: &CurlEntry,
     key: &str,
@@ -435,7 +448,7 @@ fn update_plugin(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{self, BpickSpec, Common, Host};
+    use crate::config::{self, BpickSpec, Common, Config, CurlEntry, Host};
     use std::fs;
 
     fn delta_entry() -> RepoEntry {
@@ -459,6 +472,24 @@ mod tests {
             source: Some("zsh-autosuggestions.zsh".to_string()),
             run: None,
         }
+    }
+
+    #[test]
+    fn update_all_skips_curl_on_blanket_runs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let layout = Layout::new(tmp.path(), "~/.local");
+        let mut config = Config::default();
+        config.curl.push(CurlEntry {
+            name: "oh-my-zsh".to_string(),
+            url: "https://invalid.example/install.sh".to_string(),
+            common: config::test_common(),
+        });
+        let mut lock = Lock::default();
+
+        // Unfiltered: curl is excluded, so nothing runs (the url above must
+        // never be fetched) and nothing reports.
+        let reports = update_all(&config, &mut lock, &layout, false, false, None);
+        assert!(reports.is_empty());
     }
 
     #[test]
