@@ -141,6 +141,7 @@ share these fields (plus their own: `host`/`bpick`/`extract` on `[[repo]]`,
 | `rig update [tool...]` | `u` | Update everything, or just the named tools. Unfiltered runs skip `[[curl]]` tools — their scripts rerun only when named. `-f`/`--force` reinstalls. `--self` updates rig itself (binary + bootstrap), no config entry needed. |
 | `rig remove <tool...>` | `rm` | Remove a tool's rig-owned files and lock entry. |
 | `rig list` | `ls` | Configured tools, marked installed/not. |
+| `rig edit` | `e` | Open the config file in `$EDITOR`, falling back to `vi`. |
 | `rig sync [--force]` | `s` | Regenerate `init.zsh` from the config; clones missing plugins. `--force` re-probes every tool's eval cacheability. |
 | `rig doctor` | `d` | Diagnostic checks against config, lock, and shell. |
 | `rig which <command>` | `w` | Resolve a command name to the tool that provides it. |

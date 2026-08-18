@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::io::IsTerminal as _;
-use std::process::ExitCode;
+use std::process::{Command as ProcessCommand, ExitCode};
 
 use anyhow::{Context as _, anyhow, bail};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
@@ -57,6 +57,9 @@ enum Command {
     /// Run diagnostic checks
     #[command(visible_alias = "d")]
     Doctor,
+    /// Open the config file in $EDITOR (falls back to vi)
+    #[command(visible_alias = "e")]
+    Edit,
     /// Resolve a command name to the tool that provides it
     #[command(visible_alias = "w")]
     Which { command: String },
@@ -175,6 +178,7 @@ fn dispatch(command: Command) -> anyhow::Result<ExitCode> {
         Command::List => cmd_list().map(|()| ExitCode::SUCCESS),
         Command::Sync { force } => cmd_sync(force),
         Command::Doctor => cmd_doctor().map(|()| ExitCode::SUCCESS),
+        Command::Edit => cmd_edit().map(|()| ExitCode::SUCCESS),
         Command::Which { command } => cmd_which(command).map(|()| ExitCode::SUCCESS),
         Command::Completions { shell } => {
             cmd_completions(shell);
@@ -667,6 +671,26 @@ fn report_tool_set_diff(old_keys: &std::collections::HashSet<String>, config: &C
                 .join(", ")
         );
     }
+}
+
+/// Open the config file in $EDITOR, splitting arguments on whitespace
+/// instead of a shell (supports flags like `code --wait`). Empty falls back to vi.
+fn cmd_edit() -> anyhow::Result<()> {
+    let home = paths::home_dir()?;
+    let layout = Layout::new(&home, "~");
+    let editor = std::env::var("EDITOR").unwrap_or_default();
+    let parts: Vec<&str> = editor.split_whitespace().collect();
+    let program = parts.first().copied().unwrap_or("vi");
+    let mut cmd = ProcessCommand::new(program);
+    cmd.args(parts.iter().skip(1));
+    cmd.arg(&layout.config_path);
+    let status = cmd
+        .status()
+        .with_context(|| format!("failed to run editor `{editor}`"))?;
+    if !status.success() {
+        bail!("editor exited with {status}");
+    }
+    Ok(())
 }
 
 fn cmd_doctor() -> anyhow::Result<()> {
