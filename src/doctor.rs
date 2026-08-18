@@ -8,7 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::config::{self, CompletionsSpec, Config, SetupSpec};
+use crate::config::{self, Config, SetupSpec};
 use crate::evalcache;
 use crate::lock::Lock;
 use crate::paths::Layout;
@@ -56,7 +56,6 @@ pub fn run(config: &Config, lock: &Lock, layout: &Layout) -> Vec<Finding> {
     findings.extend(check_orphan_pkg_dirs(lock, layout));
     findings.extend(check_dangling_symlinks(layout));
     findings.extend(check_foreign_prefix_bin(config, lock, layout));
-    findings.extend(check_missing_completions(config, lock));
     findings.extend(check_shadowed_completions(lock, SYSTEM_COMPLETION_DIRS));
     findings.extend(check_sudo_in_setup(config));
     findings.extend(check_unguarded_compdef(lock));
@@ -235,26 +234,6 @@ fn check_foreign_prefix_bin(config: &Config, lock: &Lock, layout: &Layout) -> Ve
                     candidate.display()
                 )));
             }
-        }
-    }
-    findings
-}
-
-fn check_missing_completions(config: &Config, lock: &Lock) -> Vec<Finding> {
-    let mut findings = Vec::new();
-    for entry in config::all_entries(config) {
-        let Some(common) = entry.common() else {
-            continue;
-        };
-        let key = entry.key();
-        let Some(tool) = lock.tool.get(&key) else {
-            continue;
-        };
-        let wants_completions = !matches!(common.completions, CompletionsSpec::Enabled(false));
-        if wants_completions && tool.completions.is_empty() {
-            findings.push(warn(format!(
-                "{key} is installed but has no registered completions"
-            )));
         }
     }
     findings
