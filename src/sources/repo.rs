@@ -9,6 +9,7 @@ use time::OffsetDateTime;
 use crate::config::{self, RepoEntry};
 use crate::lock::{Lock, ToolLock};
 use crate::paths::Layout;
+use crate::version::display_version;
 use crate::version::github::{self, Asset};
 
 use super::{
@@ -25,14 +26,16 @@ pub fn install(
     phase: Phase,
 ) -> anyhow::Result<ToolLock> {
     let tool = tool_key(&entry.name);
-    println!(
-        "installing {} via {} release",
-        entry.name,
-        entry.host.prefix()
-    );
-
     let release = github::latest_release(&entry.name, entry.host)
         .with_context(|| format!("failed to resolve latest release for {}", entry.name))?;
+    eprintln!(
+        "{tool}: {} {} via {} release ({})",
+        phase.verb(),
+        display_version(&release.tag),
+        entry.host.prefix(),
+        entry.name
+    );
+
     let asset = match select_asset(&release.assets, entry.bpick.as_ref()) {
         AssetPick::Found(asset) => asset,
         AssetPick::NoMatch {
@@ -64,10 +67,16 @@ pub fn install(
         }
     };
 
-    println!("  picked asset: {}", asset.name);
+    eprintln!("{tool}: asset {}", asset.name);
     let cache_path = layout.cache_dir.join(&asset.name);
-    download(&asset.url, &cache_path, asset.size, asset.digest.as_deref())
-        .with_context(|| format!("failed to download {}", asset.name))?;
+    download(
+        tool,
+        &asset.url,
+        &cache_path,
+        asset.size,
+        asset.digest.as_deref(),
+    )
+    .with_context(|| format!("failed to download {}", asset.name))?;
 
     let tool_dir = layout.tool_pkg_dir(tool);
     let final_dir = layout.pkg_dir(tool, &release.tag);

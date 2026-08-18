@@ -18,11 +18,15 @@ use super::{Phase, apply_env, collect_completions, resolve_declared_bins, run_se
 pub fn install(entry: &AptEntry, layout: &Layout, phase: Phase) -> anyhow::Result<ToolLock> {
     let tool = tool_key(&entry.name);
 
-    eprintln!(
-        "installing {} via `sudo apt-get install` — outside rig's own pkg tree, \
-         `rig remove` will run `apt-get remove` to undo it",
-        entry.name
-    );
+    eprintln!("{tool}: {} via sudo apt-get install", phase.verb());
+    // Only on install: every `rig update` reruns apt-get, and repeating the
+    // caveat on each one is noise rather than news.
+    if matches!(phase, Phase::Install) {
+        eprintln!(
+            "{tool}: warning: apt packages land outside rig's pkg tree; \
+             `rig remove` will run `apt-get remove` to undo"
+        );
+    }
     let mut command = Command::new("sudo");
     command.args(["apt-get", "install", "-y"]).arg(&entry.name);
     apply_env(&mut command, &entry.common.env)?;

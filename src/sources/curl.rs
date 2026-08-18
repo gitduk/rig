@@ -25,7 +25,12 @@ use super::{
 
 pub fn install(entry: &CurlEntry, layout: &Layout, phase: Phase) -> anyhow::Result<ToolLock> {
     let tool = tool_key(&entry.name);
-    println!("installing {} via curl ({})", entry.name, entry.url);
+    // `[[curl]]` has no version to compare, so an update is a plain rerun —
+    // `Phase::verb`'s "updating" would overstate what happens here.
+    match phase {
+        Phase::Install => eprintln!("{tool}: installing via curl ({})", entry.url),
+        Phase::Update => eprintln!("{tool}: rerunning install script ({})", entry.url),
+    }
     let script = fetch_script(&entry.url)?;
 
     let work_dir = layout.tool_pkg_dir(tool).join("install");
@@ -82,7 +87,7 @@ pub fn install(entry: &CurlEntry, layout: &Layout, phase: Phase) -> anyhow::Resu
         super::resolve_eval_cache(entry.common.eval.as_ref());
 
     Ok(ToolLock {
-        version: "unversioned".to_string(),
+        version: crate::version::UNVERSIONED.to_string(),
         source: format!("curl:{}", entry.name),
         installed_at: OffsetDateTime::now_utc(),
         bins,

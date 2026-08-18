@@ -115,8 +115,9 @@ pub fn update_self(force: bool, layout: &Layout, lock: &mut Lock) -> anyhow::Res
     // Same directory as the live binary keeps the final rename on one
     // filesystem; overwriting a running binary is safe on Unix.
     let tmp_bin = layout.prefix_bin_dir.join(".rig-self-update");
-    println!("  downloading {SELF_ASSET}");
+    eprintln!("rig: downloading {SELF_ASSET}");
     sources::download(
+        "rig",
         &bin_asset.url,
         &tmp_bin,
         bin_asset.size,
@@ -131,7 +132,9 @@ pub fn update_self(force: bool, layout: &Layout, lock: &mut Lock) -> anyhow::Res
     }
 
     let tmp_boot = layout.state_dir.join(format!(".{BOOTSTRAP_ASSET}.new"));
+    eprintln!("rig: downloading {BOOTSTRAP_ASSET}");
     sources::download(
+        "rig",
         &boot_asset.url,
         &tmp_boot,
         boot_asset.size,

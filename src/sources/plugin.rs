@@ -21,6 +21,11 @@ pub fn install(entry: &PluginEntry, layout: &Layout) -> anyhow::Result<ToolLock>
         bail!("{} already cloned; use update() to pull", dest.display());
     }
 
+    eprintln!(
+        "{}: installing via git clone ({})",
+        tool_key(&entry.name),
+        entry.name
+    );
     let url = format!("https://github.com/{}.git", entry.name);
     let status = Command::new("git")
         .args(["clone", "--quiet", &url])
@@ -35,6 +40,11 @@ pub fn install(entry: &PluginEntry, layout: &Layout) -> anyhow::Result<ToolLock>
 
 pub fn update(entry: &PluginEntry, layout: &Layout) -> anyhow::Result<ToolLock> {
     let dest = layout.plugins_dir.join(tool_key(&entry.name));
+    eprintln!(
+        "{}: updating via git pull ({})",
+        tool_key(&entry.name),
+        entry.name
+    );
     let status = Command::new("git")
         .args(["pull", "--quiet"])
         .current_dir(&dest)

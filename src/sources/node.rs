@@ -12,7 +12,7 @@ use time::OffsetDateTime;
 use crate::config::{BinSpec, NodeEntry, NodeManager};
 use crate::lock::{Lock, ToolLock};
 use crate::paths::Layout;
-use crate::version::npm;
+use crate::version::{display_version, npm};
 
 use super::tool_key;
 
@@ -73,15 +73,16 @@ pub fn install_with_manager(
     manager: ResolvedManager,
     phase: super::Phase,
 ) -> anyhow::Result<ToolLock> {
-    println!("installing {} via {}", entry.name, manager.binary_name());
     let info = npm::latest(&entry.name)?;
     let bin_names = declared_bin_names(entry, &info);
 
-    println!(
-        "  {} install -g {}@{}",
+    eprintln!(
+        "{}: {} {} via {} ({})",
+        tool_key(&entry.name),
+        phase.verb(),
+        display_version(&info.version),
         manager.binary_name(),
-        entry.name,
-        info.version
+        entry.name
     );
     let (root, bin_dir) = match manager {
         ResolvedManager::Bun => install_via_bun(entry, layout, &info.version, &bin_names, lock)?,

@@ -11,7 +11,7 @@ use time::OffsetDateTime;
 use crate::config::CargoEntry;
 use crate::lock::{Lock, ToolLock};
 use crate::paths::Layout;
-use crate::version::crates_io;
+use crate::version::{crates_io, display_version};
 
 use super::{Phase, apply_env, collect_artifacts, finalize_partial, run_setup, tool_key};
 
@@ -22,9 +22,13 @@ pub fn install(
     phase: Phase,
 ) -> anyhow::Result<ToolLock> {
     let tool = tool_key(&entry.name);
-    println!("installing {} via cargo", entry.name);
     let version = crates_io::latest_version(&entry.name)
         .with_context(|| format!("failed to resolve latest version for {}", entry.name))?;
+    eprintln!(
+        "{tool}: {} {} via cargo",
+        phase.verb(),
+        display_version(&version)
+    );
 
     let tool_dir = layout.tool_pkg_dir(tool);
     let final_dir = layout.pkg_dir(tool, &version);
@@ -34,7 +38,6 @@ pub fn install(
             .with_context(|| format!("failed to remove stale {}", partial_dir.display()))?;
     }
 
-    println!("  cargo install --version {version} {}", entry.name);
     let mut command = Command::new("cargo");
     command
         .arg("install")

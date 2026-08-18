@@ -17,6 +17,7 @@ use crate::pool;
 use crate::remove;
 use crate::sources;
 use crate::update;
+use crate::version::{UNVERSIONED, display_version};
 
 #[derive(Parser)]
 #[command(name = "rig", version, about = "Tool installer + zsh loader")]
@@ -267,37 +268,21 @@ fn cmd_install(tools: Vec<String>) -> anyhow::Result<ExitCode> {
                 print_error(Some(&name), &e);
             }
             Ok((key, outcome)) => {
-                let persisted = match outcome {
-                    InstallOutcome::AlreadyCurrent => None,
-                    InstallOutcome::Installed(new) => {
-                        let v = new.version.clone();
-                        Some((new, format!("installed {key} {v}")))
-                    }
-                    InstallOutcome::Updated { from, lock: new } => {
-                        let v = new.version.clone();
-                        Some((new, format!("updated {key} {from} -> {v}")))
-                    }
+                let message = describe_install_outcome(&outcome);
+                let new_lock = match outcome {
+                    InstallOutcome::AlreadyCurrent { .. } => None,
+                    InstallOutcome::Installed(new) => Some(new),
+                    InstallOutcome::Updated { lock: new, .. } => Some(new),
                 };
-                match persisted {
-                    None => {
-                        // Healthy, update check found nothing newer. The merged
-                        // lock only grows from the snapshot, so the entry exists.
-                        let existing = lock
-                            .tool
-                            .get(&key)
-                            .expect("a healthy tool's lock entry can't vanish mid-batch");
-                        println!(
-                            "{key} is already installed and up to date ({})",
-                            existing.version
-                        );
-                    }
-                    Some((entry, message)) => {
+                match new_lock {
+                    None => println!("{key}: {message}"),
+                    Some(entry) => {
                         lock.tool.insert(key.clone(), entry);
                         if let Err(e) = lock::save_and_sync(&config, &lock, &layout) {
                             failed = true;
                             print_error(Some(&name), &e);
                         } else {
-                            println!("{message}");
+                            println!("{key}: {message}");
                         }
                     }
                 }
@@ -320,7 +305,26 @@ enum InstallOutcome {
     /// Was already installed; a newer version replaced it.
     Updated { from: String, lock: ToolLock },
     /// Already installed and already the latest.
-    AlreadyCurrent,
+    AlreadyCurrent { version: String },
+}
+
+/// Install-path counterpart to `describe_outcome`, worded identically so the
+/// two commands can't drift into reporting the same result differently.
+fn describe_install_outcome(outcome: &InstallOutcome) -> String {
+    match outcome {
+        InstallOutcome::Installed(lock) if lock.version == UNVERSIONED => "installed".to_string(),
+        InstallOutcome::Installed(lock) => {
+            format!("installed {}", display_version(&lock.version))
+        }
+        InstallOutcome::Updated { from, lock } => format!(
+            "updated {} -> {}",
+            display_version(from),
+            display_version(&lock.version)
+        ),
+        InstallOutcome::AlreadyCurrent { version } => {
+            format!("up to date ({})", display_version(version))
+        }
+    }
 }
 
 /// Installs one tool. Pure: reads `config`/`lock`/`layout`, never mutates
@@ -358,7 +362,7 @@ fn install_one(
             let from = existing.version.clone();
             let outcome = match update::check_and_update(config, lock, layout, requested)? {
                 Some(new) => InstallOutcome::Updated { from, lock: new },
-                None => InstallOutcome::AlreadyCurrent,
+                None => InstallOutcome::AlreadyCurrent { version: from },
             };
             return Ok((key, outcome));
         }
@@ -381,29 +385,16 @@ fn install_one(
 /// Serial wrapper for callers that need the lock merged immediately
 /// (`cmd_sync`'s plugin backfill) — same semantics as `install_one` + merge.
 fn install_entry(ctx: &mut Ctx, requested: &str) -> anyhow::Result<()> {
-    match install_one(&ctx.config, &ctx.lock, &ctx.layout, requested)? {
-        (key, InstallOutcome::Installed(tool_lock)) => {
-            println!("installed {key} {}", tool_lock.version);
+    let (key, outcome) = install_one(&ctx.config, &ctx.lock, &ctx.layout, requested)?;
+    println!("{key}: {}", describe_install_outcome(&outcome));
+    match outcome {
+        InstallOutcome::Installed(tool_lock)
+        | InstallOutcome::Updated {
+            lock: tool_lock, ..
+        } => {
             ctx.lock.tool.insert(key, tool_lock);
         }
-        (
-            key,
-            InstallOutcome::Updated {
-                from,
-                lock: tool_lock,
-            },
-        ) => {
-            println!("updated {key} {from} -> {}", tool_lock.version);
-            ctx.lock.tool.insert(key, tool_lock);
-        }
-        (key, InstallOutcome::AlreadyCurrent) => {
-            if let Some(existing) = ctx.lock.tool.get(&key) {
-                println!(
-                    "{key} is already installed and up to date ({})",
-                    existing.version
-                );
-            }
-        }
+        InstallOutcome::AlreadyCurrent { .. } => {}
     }
     Ok(())
 }
@@ -417,7 +408,7 @@ fn cmd_self_update(force: bool) -> anyhow::Result<ExitCode> {
     // still works (`rig update rig` runs the repo flow) but is redundant.
     if config::resolve_tool(&ctx.config, "rig").is_some() {
         eprintln!(
-            "note: the `[[repo]] gitduk/rig` config entry is redundant — \
+            "rig: warning: the `[[repo]] gitduk/rig` config entry is redundant — \
              rig updates itself via `rig update --self`; you can remove it"
         );
     }
@@ -454,6 +445,11 @@ fn cmd_update(tools: Vec<String>, force: bool) -> anyhow::Result<ExitCode> {
 /// Shared by `cmd_update` and `cmd_sync --force`. Returns whether any
 /// report failed.
 fn print_reports(reports: &[update::Report]) -> bool {
+    // `update_all` returns completion order, i.e. network-latency order —
+    // sorted so two runs of the same command produce comparable output.
+    let mut reports: Vec<&update::Report> = reports.iter().collect();
+    reports.sort_by(|a, b| a.tool.cmp(&b.tool));
+
     let mut failed = false;
     for report in reports {
         match &report.outcome {
@@ -469,8 +465,14 @@ fn print_reports(reports: &[update::Report]) -> bool {
 
 fn describe_outcome(outcome: &update::Outcome) -> String {
     match outcome {
-        update::Outcome::UpToDate { version } => format!("up to date ({version})"),
-        update::Outcome::Updated { from, to } => format!("updated {from} -> {to}"),
+        update::Outcome::UpToDate { version } => {
+            format!("up to date ({})", display_version(version))
+        }
+        update::Outcome::Updated { from, to } => format!(
+            "updated {} -> {}",
+            display_version(from),
+            display_version(to)
+        ),
         update::Outcome::Reran => "rerun".to_string(),
         update::Outcome::EvalRefreshed { cacheable } => {
             let label = match cacheable {
@@ -518,9 +520,9 @@ fn remove_one(ctx: &mut Ctx, requested: &str) -> anyhow::Result<()> {
         .tool
         .get(&key)
         .ok_or_else(|| anyhow!("{key} is not installed"))?;
-    remove::remove(tool_lock, &ctx.layout)?;
+    remove::remove(&key, tool_lock, &ctx.layout)?;
     ctx.lock.tool.remove(&key);
-    println!("removed {key}");
+    println!("{key}: removed");
     Ok(())
 }
 
@@ -549,7 +551,7 @@ fn cmd_sync(force: bool) -> anyhow::Result<ExitCode> {
     // Non-blocking: `rig sync` runs unattended on shell startup, so it skips
     // rather than hang behind a slow install — the holder regenerates init.zsh.
     let Some(_state_lock) = lock::StateLock::try_acquire(&state_lock_path()?)? else {
-        eprintln!("another rig process is running; skipping sync");
+        eprintln!("rig: warning: another rig process is running; skipping sync");
         return Ok(ExitCode::SUCCESS);
     };
     let mut ctx = Ctx::load()?;

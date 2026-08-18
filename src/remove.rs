@@ -12,11 +12,11 @@ use crate::lock::ToolLock;
 use crate::paths::Layout;
 use crate::sources::node::ResolvedManager;
 
-pub fn remove(tool: &ToolLock, layout: &Layout) -> anyhow::Result<()> {
+pub fn remove(key: &str, tool: &ToolLock, layout: &Layout) -> anyhow::Result<()> {
     if let Some(manager) = &tool.manager {
         uninstall_node_package(tool, manager, layout)?;
     } else if tool.source.starts_with("apt:") {
-        uninstall_apt_package(tool)?;
+        uninstall_apt_package(key, tool)?;
     }
     for bin in &tool.bins {
         remove_owned_symlink(Path::new(bin), layout)?;
@@ -69,12 +69,12 @@ fn uninstall_node_package(tool: &ToolLock, manager: &str, layout: &Layout) -> an
 
 /// An apt package's files are placed by dpkg outside `state_dir` (see
 /// `sources::apt`'s doc comment), so only `apt-get remove` can undo it.
-fn uninstall_apt_package(tool: &ToolLock) -> anyhow::Result<()> {
+fn uninstall_apt_package(key: &str, tool: &ToolLock) -> anyhow::Result<()> {
     let name = tool
         .source
         .strip_prefix("apt:")
         .with_context(|| format!("malformed apt source in rig.lock: {}", tool.source))?;
-    eprintln!("removing {name} via `sudo apt-get remove -y`");
+    eprintln!("{key}: removing via `sudo apt-get remove -y {name}`");
     let status = Command::new("sudo")
         .args(["apt-get", "remove", "-y", name])
         .status()
@@ -133,7 +133,7 @@ mod tests {
     fn uninstall_apt_package_rejects_a_malformed_source() {
         let mut tool = tool_lock(Vec::new(), None);
         tool.source = "cargo:ripgrep".to_string();
-        let err = uninstall_apt_package(&tool).expect_err("source has no apt: prefix");
+        let err = uninstall_apt_package("ripgrep", &tool).expect_err("source has no apt: prefix");
         assert!(err.to_string().contains("cargo:ripgrep"));
     }
 
@@ -240,7 +240,7 @@ mod tests {
             vec![bin_link.display().to_string()],
             Some(pkg_dir.display().to_string()),
         );
-        remove(&tool, &layout).expect("remove should succeed");
+        remove("delta", &tool, &layout).expect("remove should succeed");
 
         assert!(!bin_link.exists());
         assert!(!bin_link.is_symlink());
@@ -263,7 +263,7 @@ mod tests {
         symlink(&outside, &bin_link).expect("create symlink");
 
         let tool = tool_lock(vec![bin_link.display().to_string()], None);
-        remove(&tool, &layout).expect("remove should succeed");
+        remove("delta", &tool, &layout).expect("remove should succeed");
 
         assert!(
             bin_link.is_symlink(),

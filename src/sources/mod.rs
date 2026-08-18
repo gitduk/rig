@@ -227,6 +227,7 @@ pub fn glob_match(pattern: &str, name: &str) -> bool {
 /// — a mismatch means the asset was replaced upstream or corrupted in
 /// transit, not just truncated.
 pub fn download(
+    tool: &str,
     url: &str,
     dest: &Path,
     expected_size: u64,
@@ -267,7 +268,7 @@ pub fn download(
              (truncated download or asset changed upstream)"
         );
     }
-    verify_digest(digest, &hasher.finalize()).with_context(|| {
+    verify_digest(tool, digest, &hasher.finalize()).with_context(|| {
         format!(
             "sha256 of {} doesn't match the release's digest",
             dest.display()
@@ -278,12 +279,12 @@ pub fn download(
 /// `sha256:<hex>` is the only shape seen in the wild (GitHub emits it,
 /// Codeberg doesn't). Unknown algorithms degrade to size-only checking,
 /// matching the no-digest path — never hard-fail on a missing capability.
-fn verify_digest(digest: Option<&str>, actual: &[u8]) -> anyhow::Result<()> {
+fn verify_digest(tool: &str, digest: Option<&str>, actual: &[u8]) -> anyhow::Result<()> {
     let Some(digest) = digest else {
         return Ok(());
     };
     let Some(hex) = digest.strip_prefix("sha256:") else {
-        eprintln!("warning: unrecognized asset digest `{digest}`, skipping hash check");
+        eprintln!("{tool}: warning: unrecognized asset digest `{digest}`, skipping hash check");
         return Ok(());
     };
     let actual_hex = to_hex(actual);
@@ -733,6 +734,17 @@ fn link_completions(sources: &[PathBuf], completions_dir: &Path) -> anyhow::Resu
 pub enum Phase {
     Install,
     Update,
+}
+
+impl Phase {
+    /// Present participle for progress lines, so `rig update` stops
+    /// announcing "installing".
+    pub fn verb(self) -> &'static str {
+        match self {
+            Phase::Install => "installing",
+            Phase::Update => "updating",
+        }
+    }
 }
 
 /// `setup`: one field covering both install and update — see the `Split`
@@ -1277,14 +1289,15 @@ mod tests {
     fn verify_digest_matches_and_degrades() {
         let actual = Sha256::digest(b"payload");
         let hex = to_hex(&actual);
-        verify_digest(Some(&format!("sha256:{hex}")), &actual).expect("matching hex passes");
+        verify_digest("test", Some(&format!("sha256:{hex}")), &actual)
+            .expect("matching hex passes");
 
-        let err = verify_digest(Some(&format!("sha256:{}", "0".repeat(64))), &actual)
+        let err = verify_digest("test", Some(&format!("sha256:{}", "0".repeat(64))), &actual)
             .expect_err("mismatching hex must fail");
         assert!(err.to_string().contains("expected"), "unexpected: {err}");
 
-        verify_digest(None, &actual).expect("missing digest passes");
-        verify_digest(Some("md5:beef"), &actual).expect("unknown algorithm degrades");
+        verify_digest("test", None, &actual).expect("missing digest passes");
+        verify_digest("test", Some("md5:beef"), &actual).expect("unknown algorithm degrades");
     }
 
     #[test]
@@ -1294,6 +1307,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let digest = format!("sha256:{}", sha256_hex(&body));
         download(
+            "test",
             &url,
             &tmp.path().join("asset"),
             body.len() as u64,
@@ -1309,6 +1323,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let digest = format!("sha256:{}", "0".repeat(64));
         let err = download(
+            "test",
             &url,
             &tmp.path().join("asset"),
             body.len() as u64,
@@ -1323,8 +1338,14 @@ mod tests {
         let body = b"rig digest test payload".to_vec();
         let url = serve_once(body.clone());
         let tmp = tempfile::tempdir().expect("tempdir");
-        download(&url, &tmp.path().join("asset"), body.len() as u64, None)
-            .expect("no digest must pass");
+        download(
+            "test",
+            &url,
+            &tmp.path().join("asset"),
+            body.len() as u64,
+            None,
+        )
+        .expect("no digest must pass");
     }
 
     #[test]
@@ -1333,6 +1354,7 @@ mod tests {
         let url = serve_once(body.clone());
         let tmp = tempfile::tempdir().expect("tempdir");
         download(
+            "test",
             &url,
             &tmp.path().join("asset"),
             body.len() as u64,
@@ -1346,8 +1368,14 @@ mod tests {
         let body = b"rig digest test payload".to_vec();
         let url = serve_once(body.clone());
         let tmp = tempfile::tempdir().expect("tempdir");
-        let err = download(&url, &tmp.path().join("asset"), body.len() as u64 + 1, None)
-            .expect_err("size mismatch must fail");
+        let err = download(
+            "test",
+            &url,
+            &tmp.path().join("asset"),
+            body.len() as u64 + 1,
+            None,
+        )
+        .expect_err("size mismatch must fail");
         assert!(err.to_string().contains("expected"), "unexpected: {err}");
     }
 
