@@ -2,6 +2,7 @@
 //! "not cacheable"; new judges can only make the verdict more conservative,
 //! never flip a cacheable verdict back.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::process::Command;
 
@@ -62,7 +63,8 @@ pub fn probe(cmd: &str) -> anyhow::Result<Probe> {
         reasons.push("nondeterministic".to_string());
     }
 
-    reasons.extend(content_hits(&baseline));
+    let tmpdir = std::env::var("TMPDIR").unwrap_or_default();
+    reasons.extend(content_hits(&baseline, &current_path, &tmpdir));
 
     Ok(Probe {
         cacheable: reasons.is_empty(),
@@ -92,7 +94,7 @@ fn run(cmd: &str, cwd: Option<&Path>, env_overrides: &[(&str, String)]) -> anyho
 
 /// Content-family fallback: baked-in session-specific data that the
 /// differential probes above might not happen to disturb.
-fn content_hits(output: &str) -> Vec<String> {
+fn content_hits(output: &str, path: &str, tmpdir: &str) -> Vec<String> {
     let mut hits = Vec::new();
     if output.contains("/run/user/") {
         hits.push("content:/run/user/".to_string());
@@ -100,23 +102,21 @@ fn content_hits(output: &str) -> Vec<String> {
     if output.contains("/proc/") {
         hits.push("content:/proc/".to_string());
     }
-    if contains_tmp_dir(output) {
+    if contains_tmp_dir(output, tmpdir) {
         hits.push("content:tmp-dir".to_string());
     }
     if output.contains(&std::process::id().to_string()) {
         hits.push("content:pid".to_string());
     }
-    if path_component_hits(output) >= 3 {
+    if path_component_hits(output, path) >= 3 {
         hits.push("content:path-components".to_string());
     }
     hits
 }
 
-fn contains_tmp_dir(output: &str) -> bool {
-    if let Ok(tmpdir) = std::env::var("TMPDIR")
-        && !tmpdir.is_empty()
-        && output.contains(&tmpdir)
-    {
+fn contains_tmp_dir(output: &str, tmpdir: &str) -> bool {
+    let tmpdir = tmpdir.trim_end_matches('/');
+    if !tmpdir.is_empty() && contains_path_component(output, tmpdir) {
         return true;
     }
     // mktemp(1)'s own convention, e.g. `/tmp/tmp.XXXXXXXXXX`.
@@ -125,14 +125,40 @@ fn contains_tmp_dir(output: &str) -> bool {
         .any(|word| word.len() > 4 && word.starts_with("tmp."))
 }
 
-fn path_component_hits(output: &str) -> usize {
-    std::env::var("PATH")
-        .map(|path| {
-            path.split(':')
-                .filter(|component| !component.is_empty() && output.contains(component))
-                .count()
+/// Takes `PATH` as a parameter rather than reading it internally, so the
+/// counting rules are testable without mutating process environment.
+fn path_component_hits(output: &str, path: &str) -> usize {
+    let mut seen = HashSet::new();
+    path.split(':')
+        // A trailing slash names the same directory; bare `/` matches every
+        // path and is evidence of nothing.
+        .map(|component| component.trim_end_matches('/'))
+        .filter(|component| {
+            !component.is_empty()
+                && seen.insert(*component)
+                && contains_path_component(output, component)
         })
-        .unwrap_or(0)
+        .count()
+}
+
+/// Non-empty `component` only. Plain `contains` overcounts twice: a duplicated
+/// `PATH` entry is one directory, and `/bin` sits inside `~/.local/bin`.
+fn contains_path_component(output: &str, component: &str) -> bool {
+    output.match_indices(component).any(|(idx, matched)| {
+        let starts_clean = output[..idx]
+            .chars()
+            .next_back()
+            .is_none_or(|prev| !is_path_char(prev));
+        let ends_clean = output[idx + matched.len()..]
+            .chars()
+            .next()
+            .is_none_or(|next| next == '/' || !is_path_char(next));
+        starts_clean && ends_clean
+    })
+}
+
+fn is_path_char(ch: char) -> bool {
+    ch.is_alphanumeric() || matches!(ch, '.' | '-' | '_' | '/')
 }
 
 #[cfg(test)]
@@ -164,6 +190,93 @@ mod tests {
         let result = probe("date +%s%N").expect("probe should run");
         assert!(!result.cacheable);
         assert!(result.reasons.contains(&"nondeterministic".to_string()));
+    }
+
+    #[test]
+    fn duplicate_path_entries_count_as_one_directory() {
+        let path = "/home/k/.local/bin:/home/k/.local/bin:/home/k/.local/bin";
+        assert_eq!(
+            path_component_hits("run /home/k/.local/bin/starship", path),
+            1
+        );
+    }
+
+    #[test]
+    fn short_component_does_not_match_inside_a_longer_path() {
+        // `/bin` is a suffix of `/home/k/.local/bin`, not an occurrence of it.
+        assert_eq!(
+            path_component_hits("/home/k/.local/bin/starship", "/bin"),
+            0
+        );
+        // `/usr/bin` must not be credited to the unrelated `/usr/bin2`.
+        assert_eq!(path_component_hits("look in /usr/bin2/foo", "/usr/bin"), 0);
+    }
+
+    #[test]
+    fn component_counts_at_a_path_boundary() {
+        assert_eq!(path_component_hits("added /bin to it", "/bin"), 1);
+        assert_eq!(path_component_hits("/bin/sh -c", "/bin"), 1);
+        assert_eq!(path_component_hits("\"/bin\"", "/bin"), 1);
+    }
+
+    #[test]
+    fn distinct_baked_in_directories_still_trip_the_judge() {
+        let path = "/opt/a/bin:/opt/b/bin:/opt/c/bin:/opt/d/bin";
+        let output = "PATH=/opt/a/bin:/opt/b/bin:/opt/c/bin";
+        assert_eq!(path_component_hits(output, path), 3);
+    }
+
+    #[test]
+    fn trailing_slashes_do_not_break_the_match() {
+        assert_eq!(path_component_hits("/usr/bin/ls", "/usr/bin/"), 1);
+        // Same directory written two ways is still one directory.
+        assert_eq!(path_component_hits("/usr/bin/ls", "/usr/bin:/usr/bin/"), 1);
+    }
+
+    #[test]
+    fn bare_root_component_is_not_evidence() {
+        assert_eq!(path_component_hits("/usr/bin/ls", "/"), 0);
+    }
+
+    #[test]
+    fn empty_path_components_are_skipped() {
+        assert_eq!(path_component_hits("anything", ""), 0);
+        assert_eq!(path_component_hits("/bin/sh", "::/bin::"), 1);
+    }
+
+    #[test]
+    fn tmpdir_matches_a_clean_component() {
+        assert!(contains_tmp_dir(
+            "export TMPDIR=/tmp/rig-probe",
+            "/tmp/rig-probe"
+        ));
+        assert!(contains_tmp_dir(
+            "cd /tmp/rig-probe && echo ok",
+            "/tmp/rig-probe"
+        ));
+    }
+
+    #[test]
+    fn tmpdir_with_trailing_slash_matches() {
+        assert!(contains_tmp_dir(
+            "export TMPDIR=/tmp/rig-probe",
+            "/tmp/rig-probe/"
+        ));
+    }
+
+    #[test]
+    fn tmpdir_does_not_match_inside_a_longer_path() {
+        // `/tmp/rig` is a prefix of `/tmp/rig-probe`, not an occurrence of it.
+        assert!(!contains_tmp_dir(
+            "export TMPDIR=/tmp/rig-probe",
+            "/tmp/rig"
+        ));
+    }
+
+    #[test]
+    fn empty_tmpdir_falls_back_to_mktemp_convention() {
+        assert!(!contains_tmp_dir("export TMPDIR=", ""));
+        assert!(contains_tmp_dir("created /tmp/tmp.abc123", ""));
     }
 
     #[test]
