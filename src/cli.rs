@@ -535,20 +535,33 @@ fn cmd_list() -> anyhow::Result<()> {
     let entries = config::all_entries(&ctx.config);
     for entry in &entries {
         let key = entry.key();
-        let marker = if ctx.lock.tool.contains_key(&key) {
+        let common = entry.common();
+        let tool = ctx.lock.tool.get(&key);
+        let marker = if tool.is_some() {
             "\u{25cf}"
         } else {
             "\u{25cb}"
         };
+        let mut statuses = Vec::new();
+        if common.is_some_and(|c| c.lazy) {
+            statuses.push("lazy");
+        }
+        if common.is_some_and(|c| c.eval.is_some())
+            && let Some(t) = tool
+        {
+            statuses.push(if t.eval_is_cached() { "cached" } else { "live" });
+        }
+        let label = match statuses.as_slice() {
+            [] => key,
+            _ => format!("{key} | {}", statuses.join(", ")),
+        };
         match entry.description() {
-            Some(desc) => println!("{marker} {key} - {desc}"),
-            None => println!("{marker} {key}"),
+            Some(desc) => println!("{marker} {label} - {desc}"),
+            None => println!("{marker} {label}"),
         }
     }
     Ok(())
 }
-
-/// Plugins aren't installed on demand like binaries — `sync` clones any
 /// that are missing so their `source` line in init.zsh resolves. `--force`
 /// additionally re-probes every tool's `eval` cacheability in place.
 fn cmd_sync(force: bool) -> anyhow::Result<ExitCode> {

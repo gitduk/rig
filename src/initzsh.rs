@@ -151,7 +151,7 @@ fn render_eval_blocks(out: &mut String, entries: &[(String, &Common)], lock: &Lo
 /// so the eager and lazy render paths can't disagree on this decision.
 fn render_eval_text(eval: &EvalSpec, tool_lock: &ToolLock) -> String {
     let cmd = eval.command();
-    if tool_lock.eval_cacheable == Some(true)
+    if tool_lock.eval_is_cached()
         && let Some(cached) = &tool_lock.eval_cached_output
     {
         format!("# cached: {cmd} (evidence: none — probed clean)\n{cached}\n")

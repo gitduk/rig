@@ -55,6 +55,13 @@ pub struct ToolLock {
     pub eval_evidence: Vec<String>,
 }
 
+impl ToolLock {
+    /// True when eval output was captured for inlining (cacheable verdict + stored output).
+    pub fn eval_is_cached(&self) -> bool {
+        self.eval_cacheable == Some(true) && self.eval_cached_output.is_some()
+    }
+}
+
 pub fn parse(input: &str) -> anyhow::Result<Lock> {
     toml::from_str(input).context("failed to parse rig.lock")
 }
