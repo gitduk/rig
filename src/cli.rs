@@ -1,6 +1,7 @@
 //! Subcommand dispatch: install/update/remove/list/sync/doctor/which.
 //! `main.rs` is a one-line wrapper around `run`.
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::fs;
 use std::io::IsTerminal as _;
 use std::process::{Command as ProcessCommand, ExitCode};
@@ -63,6 +64,8 @@ enum Command {
     /// Resolve a command name to the tool that provides it
     #[command(visible_alias = "w")]
     Which { command: String },
+    /// Print a tool's clone directory (cd via `cd "$(rig cd <tool>)"`)
+    Cd { tool: String },
     /// Print a shell completion script for `rig` itself
     #[command(visible_alias = "c")]
     Completions { shell: clap_complete::Shell },
@@ -177,6 +180,7 @@ fn dispatch(command: Command) -> anyhow::Result<ExitCode> {
         Command::Remove { tools } => cmd_remove(tools),
         Command::List => cmd_list().map(|()| ExitCode::SUCCESS),
         Command::Sync { force } => cmd_sync(force),
+        Command::Cd { tool } => cmd_cd(tool).map(|()| ExitCode::SUCCESS),
         Command::Doctor => cmd_doctor().map(|()| ExitCode::SUCCESS),
         Command::Edit => cmd_edit().map(|()| ExitCode::SUCCESS),
         Command::Which { command } => cmd_which(command).map(|()| ExitCode::SUCCESS),
@@ -723,6 +727,55 @@ fn cmd_doctor() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Print the on-disk directory of a tool's clone (or extracted repo), so
+/// `cd "$(rig cd <tool>)"` jumps there.
+fn cmd_cd(tool: String) -> anyhow::Result<()> {
+    let ctx = Ctx::load()?;
+    let dir = resolve_cd_dir(&ctx.config, &ctx.lock, &ctx.layout, &tool)?;
+    if !dir.is_dir() {
+        bail!("`{tool}` is not installed — nothing at {}", dir.display());
+    }
+    println!("{}", dir.display());
+    Ok(())
+}
+
+/// Map a configured tool to its on-disk repo directory: the extracted
+/// release / git clone for `[[repo]]`/`[[git]]`, the clone dir for
+/// `[[plugin]]`. The other sources install elsewhere and have none.
+fn resolve_cd_dir(
+    config: &Config,
+    lock: &Lock,
+    layout: &Layout,
+    requested: &str,
+) -> anyhow::Result<PathBuf> {
+    let entry = config::resolve_tool(config, requested)
+        .ok_or_else(|| anyhow!("no configured tool matches `{requested}`"))?;
+    let key = entry.key();
+    match &entry {
+        config::ResolvedEntry::Repo(_) | config::ResolvedEntry::Git(_) => lock
+            .tool
+            .get(&key)
+            .and_then(|tl| tl.pkg.as_deref())
+            .map(PathBuf::from)
+            .ok_or_else(|| {
+                anyhow!("`{requested}` is not installed; run `rig install {requested}` first")
+            }),
+        config::ResolvedEntry::Plugin(e) => {
+            Ok(layout.plugins_dir.join(config::tool_key(&e.name)))
+        }
+        config::ResolvedEntry::Cargo(_) => {
+            bail!("`{requested}` is a cargo install — no repo directory")
+        }
+        config::ResolvedEntry::Node(_) => {
+            bail!("`{requested}` is a node package — no repo directory")
+        }
+        config::ResolvedEntry::Apt(_) => bail!("`{requested}` is an apt package — no repo directory"),
+        config::ResolvedEntry::Curl(_) => {
+            bail!("`{requested}` is a curl install — no repo directory")
+        }
+    }
+}
+
 fn cmd_which(command: String) -> anyhow::Result<()> {
     let ctx = Ctx::load()?;
     for entry in config::all_entries(&ctx.config) {
@@ -739,4 +792,143 @@ fn cmd_which(command: String) -> anyhow::Result<()> {
         }
     }
     bail!("no configured tool provides `{command}`")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{
+        AptEntry, BinSpec, CargoEntry, Common, CurlEntry, GitEntry, Host, NodeEntry,
+        NodeManager, PluginEntry, RepoEntry,
+    };
+    use crate::lock::{test_tool_lock, ToolLock};
+    use std::path::Path;
+
+    fn layout() -> Layout {
+        Layout::new(Path::new("/home/kaige"), "~/.local")
+    }
+
+    fn repo_entry(name: &str) -> RepoEntry {
+        RepoEntry {
+            name: name.to_string(),
+            host: Host::Github,
+            bpick: None,
+            extract: None,
+            common: Common {
+                bin: Some(BinSpec::Single(name.split('/').last().unwrap().to_string())),
+                ..config::test_common()
+            },
+        }
+    }
+
+    fn sample_config() -> Config {
+        let mut config = Config::default();
+        config.repo.push(repo_entry("dandavison/delta"));
+        config.git.push(GitEntry {
+            name: "explosion-mental/wallust".to_string(),
+            host: Host::Codeberg,
+            common: Common {
+                ..config::test_common()
+            },
+        });
+        config.cargo.push(CargoEntry {
+            name: "eza-community/eza".to_string(),
+            common: Common {
+                ..config::test_common()
+            },
+        });
+        config.plugin.push(PluginEntry {
+            name: "zsh-users/zsh-autosuggestions".to_string(),
+            description: None,
+            source: None,
+            run: None,
+        });
+        config
+    }
+
+    #[test]
+    fn resolves_repo_and_git_to_their_lock_pkg_dir() {
+        let config = sample_config();
+        let mut lock = Lock::default();
+        lock.tool.insert(
+            "delta".to_string(),
+            ToolLock {
+                pkg: Some("/home/kaige/.local/share/rig/pkg/delta/0.18.2".to_string()),
+                ..test_tool_lock()
+            },
+        );
+        lock.tool.insert(
+            "wallust".to_string(),
+            ToolLock {
+                pkg: Some("/home/kaige/.local/share/rig/pkg/wallust/abc123".to_string()),
+                ..test_tool_lock()
+            },
+        );
+
+        assert_eq!(
+            resolve_cd_dir(&config, &lock, &layout(), "delta").unwrap(),
+            PathBuf::from("/home/kaige/.local/share/rig/pkg/delta/0.18.2")
+        );
+        assert_eq!(
+            resolve_cd_dir(&config, &lock, &layout(), "wallust").unwrap(),
+            PathBuf::from("/home/kaige/.local/share/rig/pkg/wallust/abc123")
+        );
+        assert_eq!(
+            resolve_cd_dir(&config, &lock, &layout(), "explosion-mental/wallust").unwrap(),
+            PathBuf::from("/home/kaige/.local/share/rig/pkg/wallust/abc123")
+        );
+    }
+    #[test]
+    fn resolves_plugin_to_its_clone_dir() {
+        let config = sample_config();
+        assert_eq!(
+            resolve_cd_dir(&config, &Lock::default(), &layout(), "zsh-autosuggestions").unwrap(),
+            PathBuf::from("/home/kaige/.local/share/rig/plugins/zsh-autosuggestions")
+        );
+    }
+
+    #[test]
+    fn rejects_installs_without_a_repo_dir() {
+        let mut config = sample_config();
+        config.node.push(NodeEntry {
+            name: "@openai/codex".to_string(),
+            manager: NodeManager::Bun,
+            common: Common {
+                ..config::test_common()
+            },
+        });
+        config.apt.push(AptEntry {
+            name: "ripgrep".to_string(),
+            common: Common {
+                ..config::test_common()
+            },
+        });
+        config.curl.push(CurlEntry {
+            name: "casey/just".to_string(),
+            url: "https://just.systems/install.sh".to_string(),
+            common: Common {
+                ..config::test_common()
+            },
+        });
+        let lock = Lock::default();
+        for tool in ["eza", "eza-community/eza", "codex", "ripgrep", "just"] {
+            let err = resolve_cd_dir(&config, &lock, &layout(), tool)
+                .expect_err("this source type has no repo dir");
+            assert!(err.to_string().contains("no repo directory"), "{err}");
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_and_not_yet_installed_tools() {
+        let config = sample_config();
+        let lock = Lock::default();
+        let err = resolve_cd_dir(&config, &lock, &layout(), "nope")
+            .expect_err("unknown tool");
+        assert!(err.to_string().contains("no configured tool"), "{err}");
+
+        let err = resolve_cd_dir(&config, &lock, &layout(), "delta")
+            .expect_err("delta is configured but never installed");
+        assert!(err.to_string().contains("not installed"), "{err}");
+    }
+
 }

@@ -129,6 +129,19 @@ fn render_rig_cmd_and_handler(out: &mut String, config: &Config, layout: &Layout
   command "$@"
 }}
 
+
+# `rig cd` must change this shell's directory, which a subprocess can't do —
+# shadow rig here and delegate every other invocation to `command rig`.
+rig() {{
+  if [[ $1 == cd ]]; then
+    local dir
+    dir=$(command rig cd "$2") || return $?
+    builtin cd -- "$dir"
+  else
+    command rig "$@"
+  fi
+}}
+
 "#,
         init_zsh = layout.init_zsh_path.display()
     ));
@@ -631,6 +644,69 @@ mod tests {
             result.status.success(),
             "zsh -n rejected generated init.zsh:\n{}\n--- output ---\n{out}",
             String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
+    #[test]
+    fn rig_cd_wrapper_changes_directory_in_the_loaded_shell() {
+        use std::fs;
+        use std::process::Command;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let layout = Layout::new(&home, "~/.local");
+        fs::create_dir_all(&home).expect("mkdir home");
+        fs::create_dir_all(&layout.state_dir).expect("mkdir state dir");
+
+        let mut config = Config::default();
+        config.repo.push(repo_entry("dandavison/delta", None));
+        let out = render(&config, &Lock::default(), &layout);
+        fs::write(&layout.init_zsh_path, &out).expect("write init.zsh");
+
+        // A fake `rig` on PATH: `cd` prints exactly the target path on stdout,
+        // like the real binary, so the wrapper's `$(...)` capture is clean.
+        let target = tmp.path().join("repo");
+        fs::create_dir_all(&target).expect("mkdir target");
+        let bin_dir = tmp.path().join("bin");
+        fs::create_dir_all(&bin_dir).expect("mkdir bin");
+        let fake_rig = bin_dir.join("rig");
+        fs::write(
+            &fake_rig,
+            format!("#!/bin/sh\n[ \"$1\" = cd ] && printf '%s\\n' '{}'\n", target.display()),
+        )
+        .expect("write fake rig");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&fake_rig, fs::Permissions::from_mode(0o755))
+                .expect("chmod fake rig");
+        }
+
+        let script = format!(
+            "source {}\nrig cd delta\npwd\n",
+            layout.init_zsh_path.display()
+        );
+        // Must not read ~/.zshenv: that can prepend ~/.local/bin to $PATH
+        // and shadow the fake rig, so keep the session clean with --no-rcs.
+        let output = Command::new("zsh")
+            .arg("--no-rcs")
+            .arg("-c")
+            .arg(&script)
+            .env(
+                "PATH",
+                format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap()),
+            )
+            .output()
+            .expect("zsh -c should run");
+        assert!(
+            output.status.success(),
+            "rig cd failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            target.display().to_string(),
+            "rig cd should change the shell's cwd to the printed path"
         );
     }
 }
