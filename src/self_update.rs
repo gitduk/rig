@@ -1,10 +1,9 @@
 //! `rig update --self` — rig manages its own binary and bootstrap without
 //! a config entry. Version knowledge lives here (mirrored by the hardcoded
-//! URLs in the `rig.zsh` bootstrap and `release.yml`); nothing in
-//! `~/.rig.toml` decides how rig updates itself.
+//! archive name in the `rig.zsh` bootstrap); nothing in `~/.rig.toml`
+//! decides how rig updates itself.
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 
@@ -17,11 +16,13 @@ use crate::sources;
 use crate::update::Outcome;
 use crate::version::github::{self, Asset};
 
-/// Binary asset name, mirrored by the bootstrap snippet in `rig.zsh` and
-/// `release.yml`'s `cp target/release/rig dist/rig-x86_64-unknown-linux-gnu`.
-const SELF_ASSET: &str = "rig-x86_64-unknown-linux-gnu";
-/// Bootstrap asset name, refreshed on a real self-update.
-const BOOTSTRAP_ASSET: &str = "rig.zsh";
+/// cargo-dist ships the linux-x86_64 build as `rig-<target>.tar.gz`
+/// (unpacking to `rig-<target>/rig`), not as a bare binary anymore.
+const SELF_ARCHIVE: &str = "rig-x86_64-unknown-linux-gnu.tar.gz";
+
+/// rig.zsh left the release archives when rig moved to cargo-dist; fetch
+/// the canonical copy from the repo on a real self-update.
+const BOOTSTRAP_URL: &str = "https://raw.githubusercontent.com/gitduk/rig/master/rig.zsh";
 
 /// The build's own version, prefixed like a release tag (`v0.9.0`) so it
 /// compares directly against `Release.tag`. Fallback only, for when the
@@ -85,10 +86,40 @@ fn pick_asset<'a>(release: &'a github::Release, name: &str) -> anyhow::Result<&'
         })
 }
 
+/// Fetches the canonical `rig.zsh` from the repo's raw URL. The raw
+/// endpoint publishes no digest; a body shorter than its content-length
+/// (or an empty one) is refused rather than persisted.
+fn fetch_bootstrap() -> anyhow::Result<String> {
+    let mut response = ureq::get(BOOTSTRAP_URL)
+        .header("User-Agent", sources::USER_AGENT)
+        .call()
+        .with_context(|| format!("failed to fetch {BOOTSTRAP_URL}"))?;
+    // None for chunked and transparently decompressed bodies — when
+    // present the comparison is byte-exact.
+    let expected = response.body().content_length();
+    let text = response
+        .body_mut()
+        .read_to_string()
+        .with_context(|| format!("failed to read response body from {BOOTSTRAP_URL}"))?;
+    let len = text.len() as u64;
+    if let Some(expected) = expected
+        && len != expected
+    {
+        bail!(
+            "downloaded {len} bytes from {BOOTSTRAP_URL}, expected {expected} \
+             (truncated download or file changed upstream)"
+        );
+    }
+    if text.trim().is_empty() {
+        bail!("{BOOTSTRAP_URL} returned an empty body");
+    }
+    Ok(text)
+}
+
 /// Replaces `~/.local/bin/rig` with the freshly downloaded build, then
 /// refreshes the bootstrap. The bootstrap is refreshed only on a real
-/// update — never on a no-op `--self` — so a release asset that lags a
-/// newer local checkout can't overwrite a newer local `rig.zsh`.
+/// update — never on a no-op `--self` — so a stale fetched `rig.zsh`
+/// can't overwrite a newer local one.
 pub fn update_self(force: bool, layout: &Layout, lock: &mut Lock) -> anyhow::Result<Outcome> {
     // The release publishes a single linux-x86_64 build; fail with a clear
     // message instead of an exec-format error after the download.
@@ -108,50 +139,49 @@ pub fn update_self(force: bool, layout: &Layout, lock: &mut Lock) -> anyhow::Res
         return Ok(Outcome::UpToDate { version: from });
     }
 
-    let bin_asset = pick_asset(&release, SELF_ASSET)?;
-    let boot_asset = pick_asset(&release, BOOTSTRAP_ASSET)?;
-    // Both downloads (the only network step) happen before anything goes
-    // live, so a network failure leaves the current rig fully intact.
-    // Same directory as the live binary keeps the final rename on one
+    let archive = pick_asset(&release, SELF_ARCHIVE)?;
+    // The bootstrap fetch and the archive download are the only network
+    // steps, and both finish before anything goes live — a failure leaves
+    // the current rig fully intact.
+    eprintln!("rig: downloading rig.zsh");
+    let bootstrap = fetch_bootstrap()?;
+    // Staging next to the live binary keeps the final rename on one
     // filesystem; overwriting a running binary is safe on Unix.
-    let tmp_bin = layout.prefix_bin_dir.join(".rig-self-update");
-    eprintln!("rig: downloading {SELF_ASSET}");
+    let tmp_tar = layout.prefix_bin_dir.join(".rig-self-update.tar.gz");
+    // `.d` suffix keeps this clear of the file older rigs left at
+    // `.rig-self-update` after a failed download.
+    let tmp_dir = layout.prefix_bin_dir.join(".rig-self-update.d");
+    eprintln!("rig: downloading {SELF_ARCHIVE}");
     sources::download(
         "rig",
-        &bin_asset.url,
-        &tmp_bin,
-        bin_asset.size,
-        bin_asset.digest.as_deref(),
+        &archive.url,
+        &tmp_tar,
+        archive.size,
+        archive.digest.as_deref(),
     )
-    .with_context(|| format!("failed to download {SELF_ASSET}"))?;
-    fs::set_permissions(&tmp_bin, fs::Permissions::from_mode(0o755))
-        .context("failed to make the downloaded build executable")?;
-    if let Err(e) = sources::run_version_smoke(&tmp_bin, SELF_ASSET) {
-        fs::remove_file(&tmp_bin).ok();
+    .with_context(|| format!("failed to download {SELF_ARCHIVE}"))?;
+    sources::extract(&tmp_tar, &tmp_dir, None)
+        .with_context(|| format!("failed to unpack {SELF_ARCHIVE}"))?;
+    // dist tarballs nest the binary one level down: `rig-<target>/rig`.
+    let tmp_bin = tmp_dir
+        .join(SELF_ARCHIVE.trim_end_matches(".tar.gz"))
+        .join("rig");
+    if let Err(e) = sources::run_version_smoke(&tmp_bin, "rig") {
+        fs::remove_file(&tmp_tar).ok();
+        fs::remove_dir_all(&tmp_dir).ok();
         return Err(e);
     }
 
-    let tmp_boot = layout.state_dir.join(format!(".{BOOTSTRAP_ASSET}.new"));
-    eprintln!("rig: downloading {BOOTSTRAP_ASSET}");
-    sources::download(
-        "rig",
-        &boot_asset.url,
-        &tmp_boot,
-        boot_asset.size,
-        boot_asset.digest.as_deref(),
-    )
-    .with_context(|| format!("failed to download {BOOTSTRAP_ASSET}"))?;
-
-    // Both artifacts are verified on disk — land them.
+    // The new build passed its smoke test — land it, then the bootstrap.
     fs::rename(&tmp_bin, &live)
         .with_context(|| format!("failed to move the new build into {}", live.display()))?;
-    let fresh = fs::read_to_string(&tmp_boot)
-        .with_context(|| format!("failed to read {}", tmp_boot.display()))?;
-    atomic_write(&layout.state_dir.join(BOOTSTRAP_ASSET), &fresh)?;
-    fs::remove_file(&tmp_boot).ok();
+    atomic_write(&layout.state_dir.join("rig.zsh"), &bootstrap)?;
+    fs::remove_file(&tmp_tar).ok();
+    fs::remove_dir_all(&tmp_dir).ok();
     // rig no longer lives in `rig.lock` — a leftover entry from the old
     // `[[repo]] gitduk/rig` config era is retired here.
     lock.tool.remove("rig");
+
     Ok(Outcome::Updated {
         from,
         to: release.tag,
@@ -200,20 +230,20 @@ mod tests {
 
     #[test]
     fn pick_asset_finds_the_named_asset() {
-        let release = release_with(&["rig.zsh", SELF_ASSET]);
+        let release = release_with(&["rig-aarch64-unknown-linux-gnu.tar.gz", SELF_ARCHIVE]);
         assert_eq!(
-            pick_asset(&release, SELF_ASSET)
+            pick_asset(&release, SELF_ARCHIVE)
                 .expect("asset should be found")
                 .name,
-            SELF_ASSET
+            SELF_ARCHIVE
         );
     }
 
     #[test]
     fn pick_asset_lists_available_assets_on_miss() {
-        let release = release_with(&["rig.zsh"]);
-        let err = pick_asset(&release, SELF_ASSET).unwrap_err().to_string();
-        assert!(err.contains(SELF_ASSET));
-        assert!(err.contains("rig.zsh"));
+        let release = release_with(&["rig-aarch64-unknown-linux-gnu.tar.gz"]);
+        let err = pick_asset(&release, SELF_ARCHIVE).unwrap_err().to_string();
+        assert!(err.contains(SELF_ARCHIVE));
+        assert!(err.contains("rig-aarch64-unknown-linux-gnu.tar.gz"));
     }
 }

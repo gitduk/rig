@@ -511,7 +511,7 @@ pub fn smoke_test_version(
 
 /// Shared `--version` gate for freshly built/downloaded bins: a build that
 /// can't even print its version must never go live. Used by the repo flow
-/// and `rig update --self`'s raw-binary swap.
+/// and `rig update --self`.
 pub fn run_version_smoke(bin: &Path, label: &str) -> anyhow::Result<()> {
     let status = Command::new(bin)
         .arg("--version")
