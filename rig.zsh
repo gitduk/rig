@@ -5,7 +5,7 @@
 #   [[ -f $_rig_zsh ]] || {
 #     mkdir -p ${_rig_zsh:h}
 #     curl -fsSL -o $_rig_zsh \
-#       https://github.com/gitduk/rig/releases/latest/download/rig.zsh
+#       https://raw.githubusercontent.com/gitduk/rig/master/rig.zsh
 #   }
 #   source $_rig_zsh
 
@@ -13,9 +13,11 @@ RIG_BIN=~/.local/bin/rig
 if [[ ! -x $RIG_BIN ]]; then
   echo "rig not found, downloading latest release..."
   mkdir -p ${RIG_BIN:h}
-  curl -fsSL -o $RIG_BIN \
-    https://github.com/gitduk/rig/releases/latest/download/rig-x86_64-unknown-linux-gnu \
-    && chmod +x $RIG_BIN
+  curl -fsSL -o ${RIG_BIN}.tar.gz \
+    https://github.com/gitduk/rig/releases/latest/download/rig-x86_64-unknown-linux-gnu.tar.gz
+  tar -xzf ${RIG_BIN}.tar.gz -C ${RIG_BIN:h} rig
+  rm -f ${RIG_BIN}.tar.gz
+  chmod +x $RIG_BIN
 fi
 
 # Unconditional sync: the bootstrap stays a thin shell that never needs
