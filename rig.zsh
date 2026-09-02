@@ -15,7 +15,7 @@ if [[ ! -x $RIG_BIN ]]; then
   mkdir -p ${RIG_BIN:h}
   curl -fsSL -o ${RIG_BIN}.tar.gz \
     https://github.com/gitduk/rig/releases/latest/download/rig-x86_64-unknown-linux-gnu.tar.gz
-  tar -xzf ${RIG_BIN}.tar.gz -C ${RIG_BIN:h} rig
+  tar -xzf ${RIG_BIN}.tar.gz -C ${RIG_BIN:h} --strip-components=1
   rm -f ${RIG_BIN}.tar.gz
   chmod +x $RIG_BIN
 fi
