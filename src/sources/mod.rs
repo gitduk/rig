@@ -23,7 +23,9 @@ use sha2::{Digest, Sha256};
 
 use crate::config::{BinSpec, BpickSpec, Common, CompletionsSpec, EvalSpec, SetupSpec};
 use crate::lock::Lock;
+use crate::output::warning;
 use crate::paths;
+use crate::version::display_version;
 use crate::version::github::Asset;
 
 /// Re-exported: definition moved to `config.rs` (where `ResolvedEntry` also needs it).
@@ -108,7 +110,7 @@ fn resolve_bin_name(
         if managed.exists() {
             return Ok(managed.display().to_string());
         }
-        eprintln!(
+        warning!(
             "warning: {name} landed outside {} after {context} — \
              recording its ambient PATH location instead",
             dir.display()
@@ -284,7 +286,7 @@ fn verify_digest(tool: &str, digest: Option<&str>, actual: &[u8]) -> anyhow::Res
         return Ok(());
     };
     let Some(hex) = digest.strip_prefix("sha256:") else {
-        eprintln!("{tool}: warning: unrecognized asset digest `{digest}`, skipping hash check");
+        warning!("{tool}: warning: unrecognized asset digest `{digest}`, skipping hash check");
         return Ok(());
     };
     let actual_hex = to_hex(actual);
@@ -342,16 +344,10 @@ pub fn extract(archive: &Path, dest: &Path, extract_flag: Option<bool>) -> anyho
 /// `.deb` is an `ar` archive wrapping `data.tar.*` — `dpkg-deb -x` unpacks
 /// straight to `dest` without touching the system package database.
 fn extract_deb(archive: &Path, dest: &Path) -> anyhow::Result<()> {
-    let status = Command::new("dpkg-deb")
-        .arg("-x")
-        .arg(archive)
-        .arg(dest)
-        .status()
-        .with_context(|| format!("failed to run `dpkg-deb -x {}`", archive.display()))?;
-    if !status.success() {
-        bail!("dpkg-deb -x {} failed ({status})", archive.display());
-    }
-    Ok(())
+    run_child(
+        Command::new("dpkg-deb").arg("-x").arg(archive).arg(dest),
+        &format!("`dpkg-deb -x {}`", archive.display()),
+    )
 }
 
 fn extract_tar_gz(archive: &Path, dest: &Path) -> anyhow::Result<()> {
@@ -513,14 +509,11 @@ pub fn smoke_test_version(
 /// can't even print its version must never go live. Used by the repo flow
 /// and `rig update --self`.
 pub fn run_version_smoke(bin: &Path, label: &str) -> anyhow::Result<()> {
-    let status = Command::new(bin)
-        .arg("--version")
-        .status()
-        .with_context(|| format!("failed to run `{label} --version`"))?;
-    if !status.success() {
-        bail!("`{label} --version` exited with {status} — refusing to make this build live");
-    }
-    Ok(())
+    run_child(
+        Command::new(bin).arg("--version"),
+        &format!("`{label} --version`"),
+    )
+    .with_context(|| format!("`{label} --version` check failed — refusing to make this build live"))
 }
 
 /// `collect_bins`'s resolution step, exposed so callers can find where the
@@ -731,18 +724,31 @@ fn link_completions(sources: &[PathBuf], completions_dir: &Path) -> anyhow::Resu
 }
 
 #[derive(Debug, Clone, Copy)]
-pub enum Phase {
+pub enum Phase<'a> {
     Install,
-    Update,
+    /// `from`: the version recorded in `rig.lock` before this update.
+    Update {
+        from: &'a str,
+    },
 }
 
-impl Phase {
+impl Phase<'_> {
     /// Present participle for progress lines, so `rig update` stops
     /// announcing "installing".
     pub fn verb(self) -> &'static str {
         match self {
             Phase::Install => "installing",
-            Phase::Update => "updating",
+            Phase::Update { .. } => "updating",
+        }
+    }
+
+    /// Version for progress lines: `to` on install, `from -> to` on update.
+    pub fn versions(self, to: &str) -> String {
+        match self {
+            Phase::Install => display_version(to).to_string(),
+            Phase::Update { from } => {
+                format!("{} -> {}", display_version(from), display_version(to))
+            }
         }
     }
 }
@@ -766,7 +772,7 @@ pub fn run_setup(
         SetupSpec::Split { install, update } => {
             let cmd = match phase {
                 Phase::Install => install,
-                Phase::Update => update,
+                Phase::Update { .. } => update,
             };
             run_shell(cmd, cwd, env)
         }
@@ -790,23 +796,63 @@ fn mentions_sudo(cmd: &str) -> bool {
 /// must not be silent about it.
 fn run_shell(cmd: &str, cwd: &Path, env: &HashMap<String, String>) -> anyhow::Result<()> {
     if mentions_sudo(cmd) {
-        eprintln!(
+        warning!(
             "warning: setup hook runs `sudo` — writes outside rig's control, \
              uninstall will be incomplete: {cmd}"
         );
     }
 
+    // `-e`: `mv a; mv b` must fail on the first `mv`, not report `mv b`'s status.
     let mut command = Command::new("sh");
-    command.arg("-c").arg(cmd).current_dir(cwd);
+    command.arg("-ec").arg(cmd).current_dir(cwd);
     apply_env(&mut command, env)?;
-    let status = command
-        .status()
-        .with_context(|| format!("failed to run setup command: {cmd}"))?;
+    run_child(&mut command, &format!("setup command `{cmd}`"))
+}
 
-    if !status.success() {
-        bail!("setup command failed ({status}): {cmd}");
+/// How many trailing lines of a failed child's captured output to keep.
+const CAPTURED_TAIL_LINES: usize = 20;
+
+/// Streaming: the child inherits the terminal. Batch mode: its output is
+/// captured, dropped on success, and attached to the error on failure —
+/// parallel children writing straight to stderr interleave unreadably.
+/// `what` names the command in messages, e.g. "`cargo install foo`".
+pub(crate) fn run_child(command: &mut Command, what: &str) -> anyhow::Result<()> {
+    run_child_in(command, what, crate::output::streaming())
+}
+
+fn run_child_in(command: &mut Command, what: &str, streaming: bool) -> anyhow::Result<()> {
+    if streaming {
+        let status = command
+            .status()
+            .with_context(|| format!("failed to run {what}"))?;
+        if !status.success() {
+            bail!("{what} failed ({status})");
+        }
+        return Ok(());
     }
-    Ok(())
+
+    // Batch mode is non-interactive: git would otherwise prompt on /dev/tty.
+    let output = command
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .with_context(|| format!("failed to run {what}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let head = format!("{what} failed ({})", output.status);
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    text.push('\n');
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    if lines.is_empty() {
+        bail!(head);
+    }
+    let skipped = lines.len().saturating_sub(CAPTURED_TAIL_LINES);
+    let mut tail = lines[skipped..].join("\n");
+    if skipped > 0 {
+        tail = format!("… {skipped} earlier lines omitted\n{tail}");
+    }
+    Err(anyhow::anyhow!(tail).context(head))
 }
 
 /// Resolves `eval` to (cacheable?, output to embed, probe evidence).
@@ -821,7 +867,7 @@ pub fn resolve_eval_cache(eval: Option<&EvalSpec>) -> (Option<bool>, Option<Stri
         Some(true) => {
             let output = crate::evalcache::capture(eval.command())
                 .inspect_err(|e| {
-                    eprintln!("warning: eval capture failed for `{}`: {e}", eval.command())
+                    warning!("warning: eval capture failed for `{}`: {e}", eval.command())
                 })
                 .ok();
             return (Some(true), output, Vec::new());
@@ -835,7 +881,7 @@ pub fn resolve_eval_cache(eval: Option<&EvalSpec>) -> (Option<bool>, Option<Stri
             (Some(probe.cacheable), output, probe.reasons)
         }
         Err(e) => {
-            eprintln!(
+            warning!(
                 "warning: eval cacheability probe failed for `{}`, falling back to live eval: {e}",
                 eval.command()
             );
@@ -1391,5 +1437,35 @@ mod tests {
         assert!(mentions_sudo("make install && /usr/bin/sudo make install"));
         assert!(!mentions_sudo("make install"));
         assert!(!mentions_sudo("ls -la"));
+    }
+
+    #[test]
+    fn run_shell_stops_at_the_first_failing_command() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let err = run_shell("false; touch reached", tmp.path(), &HashMap::new())
+            .expect_err("`false` must fail the hook");
+        assert!(err.to_string().contains("setup command"), "{err}");
+        assert!(!tmp.path().join("reached").exists());
+    }
+
+    #[test]
+    fn batch_mode_attaches_captured_output_tail_to_the_error() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "seq 1 30; echo boom >&2; exit 3"]);
+        let err = run_child_in(&mut command, "`demo`", false).expect_err("exit 3 must fail");
+
+        let chain: Vec<String> = err.chain().map(ToString::to_string).collect();
+        assert!(chain[0].starts_with("`demo` failed"), "{chain:?}");
+        let tail = &chain[1];
+        assert!(tail.starts_with("… 11 earlier lines omitted"), "{tail}");
+        assert!(tail.ends_with("boom"), "{tail}");
+        assert!(!tail.contains("\n10\n"), "{tail}");
+    }
+
+    #[test]
+    fn batch_mode_swallows_output_on_success() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "echo noisy"]);
+        run_child_in(&mut command, "`demo`", false).expect("exit 0 must succeed");
     }
 }

@@ -12,7 +12,7 @@ use time::OffsetDateTime;
 use crate::config::{BinSpec, NodeEntry, NodeManager};
 use crate::lock::{Lock, ToolLock};
 use crate::paths::Layout;
-use crate::version::{display_version, npm};
+use crate::version::npm;
 
 use super::tool_key;
 
@@ -76,11 +76,11 @@ pub fn install_with_manager(
     let info = npm::latest(&entry.name)?;
     let bin_names = declared_bin_names(entry, &info);
 
-    eprintln!(
+    crate::output::progress!(
         "{}: {} {} via {} ({})",
         tool_key(&entry.name),
         phase.verb(),
-        display_version(&info.version),
+        phase.versions(&info.version),
         manager.binary_name(),
         entry.name
     );
@@ -183,12 +183,7 @@ fn install_via_bun(
         .args(["install", "-g", &format!("{}@{version}", entry.name)])
         .env("BUN_INSTALL", prefix_dir);
     super::apply_env(&mut command, &entry.common.env)?;
-    let status = command
-        .status()
-        .with_context(|| format!("failed to run `bun install -g {}`", entry.name))?;
-    if !status.success() {
-        bail!("bun install -g {} failed ({status})", entry.name);
-    }
+    super::run_child(&mut command, &format!("`bun install -g {}`", entry.name))?;
 
     let root = prefix_dir
         .join("install/global/node_modules")
@@ -219,12 +214,7 @@ fn install_via_npm(
     let mut command = Command::new("npm");
     command.args(["install", "-g", &format!("{}@{version}", entry.name)]);
     super::apply_env(&mut command, &entry.common.env)?;
-    let status = command
-        .status()
-        .with_context(|| format!("failed to run `npm install -g {}`", entry.name))?;
-    if !status.success() {
-        bail!("npm install -g {} failed ({status})", entry.name);
-    }
+    super::run_child(&mut command, &format!("`npm install -g {}`", entry.name))?;
 
     let root = npm_prefix.join("lib/node_modules").join(&entry.name);
     Ok((root, bin_dir))

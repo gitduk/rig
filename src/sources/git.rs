@@ -11,10 +11,13 @@ use time::OffsetDateTime;
 
 use crate::config::{GitEntry, Host};
 use crate::lock::{Lock, ToolLock};
+use crate::output::progress;
 use crate::paths::Layout;
+use crate::version::display_version;
 
 use super::{
-    Phase, apply_env, collect_artifacts, finalize_partial, git_head_commit, run_setup, tool_key,
+    Phase, apply_env, collect_artifacts, finalize_partial, git_head_commit, run_child, run_setup,
+    tool_key,
 };
 
 fn clone_url(host: Host, name: &str) -> String {
@@ -48,13 +51,7 @@ fn git_clone(url: &str, dest: &Path, env: &HashMap<String, String>) -> anyhow::R
     let mut command = Command::new("git");
     command.args(["clone", "--quiet", url]).arg(dest);
     apply_env(&mut command, env)?;
-    let status = command
-        .status()
-        .with_context(|| format!("failed to run `git clone {url}`"))?;
-    if !status.success() {
-        bail!("git clone {url} failed ({status})");
-    }
-    Ok(())
+    run_child(&mut command, &format!("`git clone {url}`"))
 }
 
 /// The hook only builds (e.g. `cargo build`), never installs — rig
@@ -74,7 +71,15 @@ pub fn install(
         fs::remove_dir_all(&partial_dir)
             .with_context(|| format!("failed to remove stale {}", partial_dir.display()))?;
     }
-    eprintln!("{tool}: {} via git clone ({})", phase.verb(), entry.name);
+    // The new commit is only known after cloning, so updates show `from`.
+    match phase {
+        Phase::Install => progress!("{tool}: installing via git clone ({})", entry.name),
+        Phase::Update { from } => progress!(
+            "{tool}: updating from {} via git clone ({})",
+            display_version(from),
+            entry.name
+        ),
+    }
     git_clone(&url, &partial_dir, &entry.common.env)?;
 
     if let Some(setup) = &entry.common.setup {

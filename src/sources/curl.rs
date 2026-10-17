@@ -12,15 +12,17 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 
-use anyhow::{Context, bail};
+use anyhow::Context;
 use time::OffsetDateTime;
 
 use crate::config::CurlEntry;
 use crate::lock::ToolLock;
+use crate::output::progress;
 use crate::paths::Layout;
 
 use super::{
-    Phase, USER_AGENT, apply_env, collect_completions, resolve_declared_bins, run_setup, tool_key,
+    Phase, USER_AGENT, apply_env, collect_completions, resolve_declared_bins, run_child, run_setup,
+    tool_key,
 };
 
 pub fn install(entry: &CurlEntry, layout: &Layout, phase: Phase) -> anyhow::Result<ToolLock> {
@@ -28,8 +30,8 @@ pub fn install(entry: &CurlEntry, layout: &Layout, phase: Phase) -> anyhow::Resu
     // `[[curl]]` has no version to compare, so an update is a plain rerun —
     // `Phase::verb`'s "updating" would overstate what happens here.
     match phase {
-        Phase::Install => eprintln!("{tool}: installing via curl ({})", entry.url),
-        Phase::Update => eprintln!("{tool}: rerunning install script ({})", entry.url),
+        Phase::Install => progress!("{tool}: installing via curl ({})", entry.url),
+        Phase::Update { .. } => progress!("{tool}: rerunning install script ({})", entry.url),
     }
     let script = fetch_script(&entry.url)?;
 
@@ -56,12 +58,7 @@ pub fn install(entry: &CurlEntry, layout: &Layout, phase: Phase) -> anyhow::Resu
     command.current_dir(&work_dir);
     command.env("PATH", pinned_path(&layout.prefix_bin_dir));
     apply_env(&mut command, &entry.common.env)?;
-    let status = command
-        .status()
-        .with_context(|| format!("failed to run install script for {tool}"))?;
-    if !status.success() {
-        bail!("install script for {tool} failed ({status})");
-    }
+    run_child(&mut command, &format!("install script for {tool}"))?;
 
     if let Some(setup) = &entry.common.setup {
         run_setup(setup, &work_dir, phase, &entry.common.env)

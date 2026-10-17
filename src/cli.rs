@@ -1,10 +1,11 @@
 //! Subcommand dispatch: install/update/remove/list/sync/doctor/which.
 //! `main.rs` is a one-line wrapper around `run`.
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
-use std::io::IsTerminal as _;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, ExitCode};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, anyhow, bail};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
@@ -13,6 +14,7 @@ use crate::config::{self, Config, ResolvedEntry};
 use crate::doctor;
 use crate::initzsh;
 use crate::lock::{self, Lock, ToolLock};
+use crate::output;
 use crate::paths::{self, Layout};
 use crate::pool;
 use crate::remove;
@@ -31,13 +33,21 @@ struct Cli {
 enum Command {
     /// Install one or more configured tools
     #[command(visible_alias = "i")]
-    Install { tools: Vec<String> },
+    Install {
+        tools: Vec<String>,
+        /// Print every step and child output live, even for parallel runs
+        #[arg(short, long)]
+        verbose: bool,
+    },
     /// Update tools (omit to update everything in config.toml)
     #[command(visible_alias = "u")]
     Update {
         tools: Vec<String>,
         #[arg(short, long)]
         force: bool,
+        /// Print every step and child output live, even for parallel runs
+        #[arg(short, long, conflicts_with = "self_update")]
+        verbose: bool,
         /// Update rig itself (binary + bootstrap) instead of configured tools
         #[arg(long = "self", conflicts_with = "tools")]
         self_update: bool,
@@ -129,12 +139,16 @@ fn render_commands(cmd: &clap::Command) -> String {
         .join("\n")
 }
 
+fn color_enabled(stream: &impl IsTerminal) -> bool {
+    stream.is_terminal() && std::env::var_os("NO_COLOR").is_none()
+}
+
 /// Replaces anyhow's `{:?}` "Caused by:" chain — every `bail!` here is
 /// already a self-contained sentence, so print it as plain paragraphs.
 /// Color lives only here, never in the message text itself (which also
 /// flows through `.to_string()` in tests and could end up in a log file).
 fn print_error(prefix: Option<&str>, err: &anyhow::Error) {
-    let color = std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    let color = color_enabled(&std::io::stderr());
     let (bold_red, bold_green, dim, reset) = if color {
         ("\x1b[1;31m", "\x1b[1;32m", "\x1b[2m", "\x1b[0m")
     } else {
@@ -166,7 +180,7 @@ fn print_error(prefix: Option<&str>, err: &anyhow::Error) {
 
 fn dispatch(command: Command) -> anyhow::Result<ExitCode> {
     match command {
-        Command::Install { tools } => cmd_install(tools),
+        Command::Install { tools, verbose } => cmd_install(tools, verbose),
         Command::Update {
             self_update: true,
             force,
@@ -175,8 +189,9 @@ fn dispatch(command: Command) -> anyhow::Result<ExitCode> {
         Command::Update {
             tools,
             force,
+            verbose,
             self_update: false,
-        } => cmd_update(tools, force),
+        } => cmd_update(tools, force, verbose),
         Command::Remove { tools } => cmd_remove(tools),
         Command::List => cmd_list().map(|()| ExitCode::SUCCESS),
         Command::Sync { force } => cmd_sync(force),
@@ -230,7 +245,7 @@ fn acquire_state_lock() -> anyhow::Result<lock::StateLock> {
     lock::StateLock::acquire(&state_lock_path()?)
 }
 
-fn cmd_install(tools: Vec<String>) -> anyhow::Result<ExitCode> {
+fn cmd_install(tools: Vec<String>, verbose: bool) -> anyhow::Result<ExitCode> {
     if tools.is_empty() {
         bail!("specify at least one tool to install");
     }
@@ -247,15 +262,20 @@ fn cmd_install(tools: Vec<String>) -> anyhow::Result<ExitCode> {
     // snapshot-based conflict check, then trip each other's "already exists
     // and isn't tracked" guard on the freshly-created symlink.
     let mut seen = HashSet::new();
-    let tools: Vec<String> = tools
-        .into_iter()
-        .map(|t| {
-            config::resolve_tool(&config, &t)
-                .map(|r| r.key())
-                .unwrap_or(t)
-        })
-        .filter(|key| seen.insert(key.clone()))
-        .collect();
+    let (mut serial, mut parallel) = (Vec::new(), Vec::new());
+    for t in tools {
+        let resolved = config::resolve_tool(&config, &t);
+        let needs_terminal = resolved.as_ref().is_some_and(ResolvedEntry::needs_terminal);
+        let key = resolved.map(|r| r.key()).unwrap_or(t);
+        if !seen.insert(key.clone()) {
+            continue;
+        }
+        if needs_terminal {
+            serial.push(key);
+        } else {
+            parallel.push(key);
+        }
+    }
 
     // Workers only read shared state, so the conflict check runs against a
     // snapshot taken at batch start. The merge below keeps the first-recorded
@@ -266,16 +286,20 @@ fn cmd_install(tools: Vec<String>) -> anyhow::Result<ExitCode> {
     // Save after every tool, not once at batch end — a killed process must
     // not lose lock state for tools that already finished installing.
     let mut failed = false;
-    pool::run_pool(
-        tools,
+    pool::run_batched(
+        serial,
+        parallel,
         workers,
+        verbose,
         |name| install_one(&config, &lock_snapshot, &layout, name),
         |name, result| match result {
             Err(e) => {
+                output::clear_line();
                 failed = true;
                 print_error(Some(&name), &e);
             }
             Ok((key, outcome)) => {
+                output::clear_line();
                 let message = describe_install_outcome(&outcome);
                 let new_lock = match outcome {
                     InstallOutcome::AlreadyCurrent { .. } => None,
@@ -430,10 +454,11 @@ fn cmd_self_update(force: bool) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn cmd_update(tools: Vec<String>, force: bool) -> anyhow::Result<ExitCode> {
+fn cmd_update(tools: Vec<String>, force: bool, verbose: bool) -> anyhow::Result<ExitCode> {
     let _state_lock = acquire_state_lock()?;
     let mut ctx = Ctx::load()?;
     let filter = (!tools.is_empty()).then_some(tools.as_slice());
+    let started = Instant::now();
     let reports = update::update_all(
         &ctx.config,
         &mut ctx.lock,
@@ -441,34 +466,85 @@ fn cmd_update(tools: Vec<String>, force: bool) -> anyhow::Result<ExitCode> {
         force,
         false,
         filter,
+        verbose,
     );
 
-    Ok(if print_reports(&reports) {
-        ExitCode::FAILURE
-    } else {
-        ExitCode::SUCCESS
-    })
+    // Named tools always get an answer; a blanket run folds "up to date".
+    Ok(
+        if print_reports(&reports, filter.is_none(), started.elapsed()) {
+            ExitCode::FAILURE
+        } else {
+            ExitCode::SUCCESS
+        },
+    )
 }
 
-/// Shared by `cmd_update` and `cmd_sync --force`. Returns whether any
-/// report failed.
-fn print_reports(reports: &[update::Report]) -> bool {
+/// Shared by `cmd_update` and `cmd_sync --force`. Failures go last, nearest
+/// the prompt; `fold_up_to_date` reduces those lines to the tally. Returns
+/// whether any report failed.
+fn print_reports(reports: &[update::Report], fold_up_to_date: bool, elapsed: Duration) -> bool {
     // `update_all` returns completion order, i.e. network-latency order —
     // sorted so two runs of the same command produce comparable output.
     let mut reports: Vec<&update::Report> = reports.iter().collect();
     reports.sort_by(|a, b| a.tool.cmp(&b.tool));
 
-    let mut failed = false;
-    for report in reports {
-        match &report.outcome {
-            Ok(outcome) => println!("{}: {}", report.tool, describe_outcome(outcome)),
-            Err(e) => {
-                failed = true;
-                print_error(Some(&report.tool), e);
-            }
+    // A lone report has no tally line to carry the fold, so it always shows.
+    let fold = fold_up_to_date && reports.len() > 1;
+    let (ok, failed): (Vec<&update::Report>, Vec<&update::Report>) =
+        reports.iter().partition(|r| r.outcome.is_ok());
+    let shown: Vec<(&str, &update::Outcome)> = ok
+        .iter()
+        .filter_map(|r| Some((r.tool.as_str(), r.outcome.as_ref().ok()?)))
+        .filter(|(_, o)| !(fold && matches!(o, update::Outcome::UpToDate { .. })))
+        .collect();
+
+    let color = color_enabled(&std::io::stdout());
+    let (green, bold, reset) = if color {
+        ("\x1b[32m", "\x1b[1m", "\x1b[0m")
+    } else {
+        ("", "", "")
+    };
+    let width = shown.iter().map(|(t, _)| t.len() + 1).max().unwrap_or(0);
+    for (tool, outcome) in &shown {
+        let label = format!("{tool}:");
+        let text = describe_outcome(outcome);
+        if matches!(outcome, update::Outcome::Updated { .. }) {
+            println!("{label:<width$} {green}{text}{reset}");
+        } else {
+            println!("{label:<width$} {text}");
         }
     }
-    failed
+    for report in &failed {
+        if let Err(e) = &report.outcome {
+            print_error(Some(&report.tool), e);
+        }
+    }
+
+    if reports.len() > 1 {
+        // The rank fixes tally order; the label is what gets printed.
+        let kind = |r: &update::Report| match &r.outcome {
+            Ok(update::Outcome::Updated { .. }) => (0, "updated"),
+            Ok(update::Outcome::Reran) => (1, "rerun"),
+            Ok(update::Outcome::EvalRefreshed { .. }) => (2, "eval refreshed"),
+            Ok(update::Outcome::NoEval) => (3, "no eval"),
+            Ok(update::Outcome::UpToDate { .. }) => (4, "up to date"),
+            Err(_) => (5, "failed"),
+        };
+        let mut tally: BTreeMap<(u8, &str), usize> = BTreeMap::new();
+        for report in &reports {
+            *tally.entry(kind(report)).or_default() += 1;
+        }
+        let parts: Vec<String> = tally
+            .iter()
+            .map(|((_, label), n)| format!("{label} {n}"))
+            .collect();
+        println!(
+            "{bold}{}{reset} ({:.1}s)",
+            parts.join(" · "),
+            elapsed.as_secs_f64()
+        );
+    }
+    !failed.is_empty()
 }
 
 fn describe_outcome(outcome: &update::Outcome) -> String {
@@ -579,9 +655,17 @@ fn cmd_sync(force: bool) -> anyhow::Result<ExitCode> {
 
     let mut failed = false;
     if force {
-        let reports =
-            update::update_all(&ctx.config, &mut ctx.lock, &ctx.layout, false, true, None);
-        failed |= print_reports(&reports);
+        let started = Instant::now();
+        let reports = update::update_all(
+            &ctx.config,
+            &mut ctx.lock,
+            &ctx.layout,
+            false,
+            true,
+            None,
+            false,
+        );
+        failed |= print_reports(&reports, false, started.elapsed());
     }
 
     let old_keys = fs::read_to_string(&ctx.layout.init_zsh_path)

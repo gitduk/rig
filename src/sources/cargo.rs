@@ -5,15 +5,18 @@
 use std::fs;
 use std::process::Command;
 
-use anyhow::{Context, bail};
+use anyhow::Context;
 use time::OffsetDateTime;
 
 use crate::config::CargoEntry;
 use crate::lock::{Lock, ToolLock};
 use crate::paths::Layout;
-use crate::version::{crates_io, display_version};
+use crate::version::crates_io;
 
-use super::{Phase, apply_env, collect_artifacts, finalize_partial, run_setup, tool_key};
+use super::{
+    Phase, apply_env, collect_artifacts, finalize_partial, run_child, run_setup, tool_key,
+};
+use crate::output::progress;
 
 pub fn install(
     entry: &CargoEntry,
@@ -24,10 +27,10 @@ pub fn install(
     let tool = tool_key(&entry.name);
     let version = crates_io::latest_version(&entry.name)
         .with_context(|| format!("failed to resolve latest version for {}", entry.name))?;
-    eprintln!(
+    progress!(
         "{tool}: {} {} via cargo",
         phase.verb(),
-        display_version(&version)
+        phase.versions(&version)
     );
 
     let tool_dir = layout.tool_pkg_dir(tool);
@@ -45,12 +48,7 @@ pub fn install(
         .arg(&partial_dir)
         .args(["--version", &version, &entry.name]);
     apply_env(&mut command, &entry.common.env)?;
-    let status = command
-        .status()
-        .with_context(|| format!("failed to run `cargo install {}`", entry.name))?;
-    if !status.success() {
-        bail!("cargo install {} failed ({status})", entry.name);
-    }
+    run_child(&mut command, &format!("`cargo install {}`", entry.name))?;
 
     if let Some(setup) = &entry.common.setup {
         run_setup(setup, &partial_dir, phase, &entry.common.env)

@@ -5,8 +5,40 @@
 //! matters: merging incrementally keeps the "persist after every tool"
 //! guarantee, which a collect-then-merge API would give up.
 
+use std::io::IsTerminal as _;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
+
+use crate::output;
+
+/// `rig install`/`rig update` driver. `serial` items (apt: sudo prompts need
+/// the terminal) run first, one at a time and streaming; `parallel` items go
+/// to the pool in batch mode, unless `verbose`, a lone item, or non-TTY stderr.
+pub fn run_batched<T, R>(
+    serial: Vec<T>,
+    parallel: Vec<T>,
+    workers: usize,
+    verbose: bool,
+    job: impl Fn(&T) -> R + Sync,
+    mut on_result: impl FnMut(T, R),
+) where
+    T: Send,
+    R: Send,
+{
+    output::set_streaming(true);
+    run_pool(serial, 1, &job, &mut on_result);
+
+    let total = parallel.len();
+    output::set_streaming(verbose || total <= 1 || !std::io::stderr().is_terminal());
+    let mut done = 0;
+    output::counter(0, total);
+    run_pool(parallel, workers, &job, |item, result| {
+        on_result(item, result);
+        done += 1;
+        output::counter(done, total);
+    });
+    output::clear_line();
+}
 
 /// Runs `job` over `items` on a pool of `workers` threads, invoking
 /// `on_result` from the calling thread for each result as it arrives.

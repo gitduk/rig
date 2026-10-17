@@ -8,8 +8,8 @@ use time::OffsetDateTime;
 
 use crate::config::{self, RepoEntry};
 use crate::lock::{Lock, ToolLock};
+use crate::output::progress;
 use crate::paths::Layout;
-use crate::version::display_version;
 use crate::version::github::{self, Asset};
 
 use super::{
@@ -28,10 +28,10 @@ pub fn install(
     let tool = tool_key(&entry.name);
     let release = github::latest_release(&entry.name, entry.host)
         .with_context(|| format!("failed to resolve latest release for {}", entry.name))?;
-    eprintln!(
+    progress!(
         "{tool}: {} {} via {} release ({})",
         phase.verb(),
-        display_version(&release.tag),
+        phase.versions(&release.tag),
         entry.host.prefix(),
         entry.name
     );
@@ -67,7 +67,7 @@ pub fn install(
         }
     };
 
-    eprintln!("{tool}: asset {}", asset.name);
+    progress!("{tool}: asset {}", asset.name);
     let cache_path = layout.cache_dir.join(&asset.name);
     download(
         tool,

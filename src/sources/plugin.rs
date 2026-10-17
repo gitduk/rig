@@ -6,14 +6,15 @@
 use std::path::Path;
 use std::process::Command;
 
-use anyhow::{Context, bail};
+use anyhow::bail;
 use time::OffsetDateTime;
 
 use crate::config::PluginEntry;
 use crate::lock::ToolLock;
+use crate::output::progress;
 use crate::paths::Layout;
 
-use super::{git_head_commit, tool_key};
+use super::{git_head_commit, run_child, tool_key};
 
 pub fn install(entry: &PluginEntry, layout: &Layout) -> anyhow::Result<ToolLock> {
     let dest = layout.plugins_dir.join(tool_key(&entry.name));
@@ -21,38 +22,34 @@ pub fn install(entry: &PluginEntry, layout: &Layout) -> anyhow::Result<ToolLock>
         bail!("{} already cloned; use update() to pull", dest.display());
     }
 
-    eprintln!(
+    progress!(
         "{}: installing via git clone ({})",
         tool_key(&entry.name),
         entry.name
     );
     let url = format!("https://github.com/{}.git", entry.name);
-    let status = Command::new("git")
-        .args(["clone", "--quiet", &url])
-        .arg(&dest)
-        .status()
-        .with_context(|| format!("failed to run `git clone {url}`"))?;
-    if !status.success() {
-        bail!("git clone {url} failed ({status})");
-    }
+    run_child(
+        Command::new("git")
+            .args(["clone", "--quiet", &url])
+            .arg(&dest),
+        &format!("`git clone {url}`"),
+    )?;
     build_lock(entry, &dest)
 }
 
 pub fn update(entry: &PluginEntry, layout: &Layout) -> anyhow::Result<ToolLock> {
     let dest = layout.plugins_dir.join(tool_key(&entry.name));
-    eprintln!(
+    progress!(
         "{}: updating via git pull ({})",
         tool_key(&entry.name),
         entry.name
     );
-    let status = Command::new("git")
-        .args(["pull", "--quiet"])
-        .current_dir(&dest)
-        .status()
-        .with_context(|| format!("failed to run `git pull` in {}", dest.display()))?;
-    if !status.success() {
-        bail!("git pull in {} failed ({status})", dest.display());
-    }
+    run_child(
+        Command::new("git")
+            .args(["pull", "--quiet"])
+            .current_dir(&dest),
+        &format!("`git pull` in {}", dest.display()),
+    )?;
     build_lock(entry, &dest)
 }
 

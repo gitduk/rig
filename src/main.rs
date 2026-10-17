@@ -4,6 +4,7 @@ mod doctor;
 mod evalcache;
 mod initzsh;
 mod lock;
+mod output;
 mod paths;
 mod pool;
 mod remove;

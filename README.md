@@ -129,7 +129,7 @@ share these fields (plus their own: `host`/`bpick`/`extract` on `[[repo]]`,
 | `eval` | Shell to run at startup, e.g. `"zoxide init zsh"`. Plain string, or `{ cmd, cache }` to force cacheability. |
 | `run` | Plain shell text (aliases, etc.) run verbatim, never captured — single line, list, or a `'''...'''` block. |
 | `completions` | `true` (default: link `_*` files from the install), `false`, `{ path = "..." }` (link one file), or `{ generate = "cmd" }` (run a generator in the install dir). |
-| `setup` | Hook run during install (and update, unless `{ install, update }`). Used for builds. `sudo` here prints a warning — it writes outside rig's control. |
+| `setup` | Hook run during install (and update, unless `{ install, update }`). Used for builds. Runs under `sh -e`, so the first failing command fails the hook. `sudo` here prints a warning — it writes outside rig's control. |
 | `lazy` | Defer `env`/`eval`/`run` to first use of the tool's command name. |
 | `bind` | With `lazy`: `"key:widget"` — a placeholder ZLE widget runs the deferred setup, then rebinds the key to the real widget. |
 
@@ -137,8 +137,9 @@ share these fields (plus their own: `host`/`bpick`/`extract` on `[[repo]]`,
 
 | Command | Alias | Description |
 | --- | --- | --- |
-| `rig install <tool...>` | `i` | Install tools (folds in an update check for already-installed ones). |
-| `rig update [tool...]` | `u` | Update everything, or just the named tools. Unfiltered runs skip `[[curl]]` tools — their scripts rerun only when named. `-f`/`--force` reinstalls. `--self` updates rig itself (binary + bootstrap), no config entry needed. |
+| `rig install <tool...>` | `i` | Install tools (folds in an update check for already-installed ones). `-v`/`--verbose` streams every step (see below). |
+| `rig update [tool...]` | `u` | Update everything, or just the named tools. Unfiltered runs skip `[[curl]]` tools — their scripts rerun only when named. `-f`/`--force` reinstalls. `-v`/`--verbose` streams every step. `--self` updates rig itself (binary + bootstrap), no config entry needed. |
+
 | `rig remove <tool...>` | `rm` | Remove a tool's rig-owned files and lock entry. |
 | `rig list` | `ls` | Configured tools, marked installed/not. |
 | `rig edit` | `e` | Open the config file in `$EDITOR`, falling back to `vi`. |
@@ -147,6 +148,13 @@ share these fields (plus their own: `host`/`bpick`/`extract` on `[[repo]]`,
 | `rig which <command>` | `w` | Resolve a command name to the tool that provides it. |
 | `rig cd [tool]` | | Jump to a `[[repo]]`/`[[git]]`/`[[plugin]]` tool's directory, or rig's state dir if omitted (via the shell function in `init.zsh`). |
 | `rig completions <shell>` | `c` | Print a completion script for rig itself; tool arguments complete from the config (refreshed by `rig sync`). |
+
+When several tools run in parallel on a terminal, `install`/`update` show a
+single progress line and capture each tool's child output, printing it only
+for tools that failed; `update` then lists what changed, folds "up to date"
+into a tally on blanket runs, and puts failures last. A single tool, `-v`,
+or non-terminal output streams everything live instead. `[[apt]]` tools
+always run first, one at a time and streaming, so `sudo` can prompt.
 
 Tools can be addressed by lock key, full name (`dandavison/delta`), or any
 declared command name (`rg`), so `rig install rg` and `rig update delta`

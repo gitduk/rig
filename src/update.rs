@@ -79,7 +79,8 @@ fn apply_change(lock: &mut Lock, key: &str, change: LockChange) {
 }
 
 /// `filter`: `None` = all configured tools (`rig update`); `Some(names)` =
-/// only those lock keys (`rig update <tool...>`).
+/// only those lock keys (`rig update <tool...>`). `verbose` forces
+/// streaming output even when several tools run in parallel.
 pub fn update_all(
     config: &Config,
     lock: &mut Lock,
@@ -87,6 +88,7 @@ pub fn update_all(
     force: bool,
     refresh_eval: bool,
     filter: Option<&[String]>,
+    verbose: bool,
 ) -> Vec<Report> {
     let wanted = |key: &str| filter.is_none_or(|names| names.iter().any(|n| n == key));
     // Curl has no cheap staleness check, so an unfiltered `rig update`
@@ -96,14 +98,17 @@ pub fn update_all(
     // the version is unchanged.
     let blanket = filter.is_none();
     // Collect (key, full name): the key feeds the report, but `resolve_tool`
-    // is only unambiguous on the full name — two entries can share a key
-    // (e.g. `foo/bar` and `baz/bar` both key as `bar`), and resolving by
-    // key would silently pick the first one for both.
-    let targets: Vec<(String, String)> = config::all_entries(config)
+    // also matches declared bin names, so a key can hit a different entry
+    // whose `bin` shares it — only the full name is unambiguous.
+    // apt's sudo prompt needs the terminal, so apt targets run first, one
+    // at a time and streaming; everything else goes to the parallel pool.
+    let (serial, parallel): (Vec<_>, Vec<_>) = config::all_entries(config)
         .into_iter()
         .filter(|e| wanted(&e.key()) && !(blanket && matches!(e, ResolvedEntry::Curl(_))))
-        .map(|e| (e.key(), e.name().to_string()))
-        .collect();
+        .partition(|e| e.needs_terminal());
+    let as_target = |e: ResolvedEntry<'_>| (e.key(), e.name().to_string());
+    let serial: Vec<(String, String)> = serial.into_iter().map(as_target).collect();
+    let parallel: Vec<(String, String)> = parallel.into_iter().map(as_target).collect();
     let workers = config.settings.parallel as usize;
 
     // Workers only read shared state, so the version check and reinstall
@@ -113,9 +118,11 @@ pub fn update_all(
     let lock_snapshot = lock.clone();
 
     let mut reports = Vec::new();
-    pool::run_pool(
-        targets,
+    pool::run_batched(
+        serial,
+        parallel,
         workers,
+        verbose,
         |(_, name)| update_one(config, &lock_snapshot, layout, name, force, refresh_eval),
         |(tool, _), result| {
             // `Some(change)` is exactly "must persist": every producer pairs
@@ -251,7 +258,14 @@ fn update_repo(
         ));
     }
 
-    let new_lock = sources::repo::install(entry, layout, lock, sources::Phase::Update)?;
+    let new_lock = sources::repo::install(
+        entry,
+        layout,
+        lock,
+        sources::Phase::Update {
+            from: &current_version,
+        },
+    )?;
     let to = new_lock.version.clone();
     Ok((
         Outcome::Updated {
@@ -281,7 +295,14 @@ fn update_git(
         ));
     }
 
-    let new_lock = sources::git::install(entry, layout, lock, sources::Phase::Update)?;
+    let new_lock = sources::git::install(
+        entry,
+        layout,
+        lock,
+        sources::Phase::Update {
+            from: &current_version,
+        },
+    )?;
     let to = new_lock.version.clone();
     Ok((
         Outcome::Updated {
@@ -313,7 +334,14 @@ fn update_cargo(
         ));
     }
 
-    let new_lock = sources::cargo::install(entry, layout, lock, sources::Phase::Update)?;
+    let new_lock = sources::cargo::install(
+        entry,
+        layout,
+        lock,
+        sources::Phase::Update {
+            from: &current_version,
+        },
+    )?;
     let to = new_lock.version.clone();
     Ok((
         Outcome::Updated {
@@ -353,8 +381,15 @@ fn update_node(
         ));
     }
 
-    let new_lock =
-        sources::node::install_with_manager(entry, layout, lock, manager, sources::Phase::Update)?;
+    let new_lock = sources::node::install_with_manager(
+        entry,
+        layout,
+        lock,
+        manager,
+        sources::Phase::Update {
+            from: &current_version,
+        },
+    )?;
     let to = new_lock.version.clone();
     Ok((
         Outcome::Updated {
@@ -375,7 +410,13 @@ fn update_apt(
 ) -> anyhow::Result<(Outcome, Option<LockChange>)> {
     let current_version = already_installed(lock, key)?;
 
-    let new_lock = sources::apt::install(entry, layout, sources::Phase::Update)?;
+    let new_lock = sources::apt::install(
+        entry,
+        layout,
+        sources::Phase::Update {
+            from: &current_version,
+        },
+    )?;
     let to = new_lock.version.clone();
     if to == current_version {
         return Ok((Outcome::UpToDate { version: to }, None));
@@ -398,10 +439,14 @@ fn update_curl(
     lock: &Lock,
     layout: &Layout,
 ) -> anyhow::Result<(Outcome, Option<LockChange>)> {
-    if !lock.tool.contains_key(key) {
-        bail!("{key} is not installed; run `rig install {key}` first");
-    }
-    let new_lock = sources::curl::install(entry, layout, sources::Phase::Update)?;
+    let current_version = already_installed(lock, key)?;
+    let new_lock = sources::curl::install(
+        entry,
+        layout,
+        sources::Phase::Update {
+            from: &current_version,
+        },
+    )?;
     Ok((
         Outcome::Reran,
         Some(LockChange::Replace(Box::new(new_lock))),
@@ -488,7 +533,7 @@ mod tests {
 
         // Unfiltered: curl is excluded, so nothing runs (the url above must
         // never be fetched) and nothing reports.
-        let reports = update_all(&config, &mut lock, &layout, false, false, None);
+        let reports = update_all(&config, &mut lock, &layout, false, false, None, false);
         assert!(reports.is_empty());
     }
 

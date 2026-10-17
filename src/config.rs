@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use serde::Deserialize;
 
 #[derive(Debug, Default, Deserialize)]
@@ -344,6 +344,24 @@ impl<'a> ResolvedEntry<'a> {
         }
     }
 
+    /// apt's `sudo` may prompt, so it must run serially with the terminal.
+    pub fn needs_terminal(&self) -> bool {
+        matches!(self, Self::Apt(_))
+    }
+
+    /// The `[[section]]` this entry came from, for messages.
+    pub fn section(&self) -> &'static str {
+        match self {
+            Self::Repo(_) => "repo",
+            Self::Git(_) => "git",
+            Self::Cargo(_) => "cargo",
+            Self::Node(_) => "node",
+            Self::Apt(_) => "apt",
+            Self::Curl(_) => "curl",
+            Self::Plugin(_) => "plugin",
+        }
+    }
+
     /// `[[node]]` keys on the full (possibly scoped) package name; every
     /// other source type keys on the short `tool_key`.
     pub fn key(&self) -> String {
@@ -381,7 +399,30 @@ pub fn resolve_tool<'a>(config: &'a Config, requested: &str) -> Option<ResolvedE
 }
 
 pub fn parse(input: &str) -> anyhow::Result<Config> {
-    toml::from_str(input).context("failed to parse config.toml")
+    let config: Config = toml::from_str(input).context("failed to parse config.toml")?;
+    check_unique_keys(&config)?;
+    Ok(config)
+}
+
+/// `rig.lock` is keyed by tool key, so two entries sharing one would
+/// overwrite each other's record and both run on `rig update <key>`.
+fn check_unique_keys(config: &Config) -> anyhow::Result<()> {
+    let mut seen: HashMap<String, ResolvedEntry<'_>> = HashMap::new();
+    for entry in all_entries(config) {
+        let key = entry.key();
+        if let Some(first) = seen.get(&key) {
+            bail!(
+                "tool key `{key}` is used by both [[{}]] {} and [[{}]] {} \
+                 — rig tracks tools by key, remove one of them",
+                first.section(),
+                first.name(),
+                entry.section(),
+                entry.name()
+            );
+        }
+        seen.insert(key, entry);
+    }
+    Ok(())
 }
 
 pub fn load(path: &Path) -> anyhow::Result<Config> {
@@ -499,6 +540,27 @@ run = "_zsh_autosuggest_start"
         assert_eq!(
             cfg.plugin[0].source.as_deref(),
             Some("zsh-autosuggestions.zsh")
+        );
+    }
+
+    #[test]
+    fn parse_rejects_entries_sharing_a_key() {
+        let err = parse(
+            r#"
+[[repo]]
+name = "casey/just"
+
+[[curl]]
+name = "casey/just"
+url = "https://just.systems/install.sh"
+"#,
+        )
+        .expect_err("duplicate key must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("`just`"), "{msg}");
+        assert!(
+            msg.contains("[[repo]]") && msg.contains("[[curl]]"),
+            "{msg}"
         );
     }
 

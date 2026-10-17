@@ -13,16 +13,20 @@ use crate::config::AptEntry;
 use crate::lock::ToolLock;
 use crate::paths::Layout;
 
-use super::{Phase, apply_env, collect_completions, resolve_declared_bins, run_setup, tool_key};
+use crate::output::{progress, warning};
+
+use super::{
+    Phase, apply_env, collect_completions, resolve_declared_bins, run_child, run_setup, tool_key,
+};
 
 pub fn install(entry: &AptEntry, layout: &Layout, phase: Phase) -> anyhow::Result<ToolLock> {
     let tool = tool_key(&entry.name);
 
-    eprintln!("{tool}: {} via sudo apt-get install", phase.verb());
+    progress!("{tool}: {} via sudo apt-get install", phase.verb());
     // Only on install: every `rig update` reruns apt-get, and repeating the
     // caveat on each one is noise rather than news.
     if matches!(phase, Phase::Install) {
-        eprintln!(
+        warning!(
             "{tool}: warning: apt packages land outside rig's pkg tree; \
              `rig remove` will run `apt-get remove` to undo"
         );
@@ -30,12 +34,11 @@ pub fn install(entry: &AptEntry, layout: &Layout, phase: Phase) -> anyhow::Resul
     let mut command = Command::new("sudo");
     command.args(["apt-get", "install", "-y"]).arg(&entry.name);
     apply_env(&mut command, &entry.common.env)?;
-    let status = command
-        .status()
-        .with_context(|| format!("failed to run `sudo apt-get install -y {}`", entry.name))?;
-    if !status.success() {
-        bail!("apt-get install -y {} failed ({status})", entry.name);
-    }
+    // `needs_terminal` keeps apt streaming, so sudo's prompt reaches the terminal.
+    run_child(
+        &mut command,
+        &format!("`sudo apt-get install -y {}`", entry.name),
+    )?;
 
     let version = dpkg_version(&entry.name)?;
 
