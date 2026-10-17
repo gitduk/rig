@@ -145,7 +145,8 @@ share these fields (plus their own: `host`/`bpick`/`extract` on `[[repo]]`,
 | `rig sync [--force]` | `s` | Regenerate `init.zsh` from the config; clones missing plugins. `--force` re-probes every tool's eval cacheability. |
 | `rig doctor` | `d` | Diagnostic checks against config, lock, and shell. |
 | `rig which <command>` | `w` | Resolve a command name to the tool that provides it. |
-| `rig completions <shell>` | `c` | Print a completion script for rig itself. |
+| `rig cd [tool]` | | Jump to a `[[repo]]`/`[[git]]`/`[[plugin]]` tool's directory, or rig's state dir if omitted (via the shell function in `init.zsh`). |
+| `rig completions <shell>` | `c` | Print a completion script for rig itself; tool arguments complete from the config (refreshed by `rig sync`). |
 
 Tools can be addressed by lock key, full name (`dandavison/delta`), or any
 declared command name (`rg`), so `rig install rg` and `rig update delta`

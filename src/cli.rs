@@ -1,9 +1,9 @@
 //! Subcommand dispatch: install/update/remove/list/sync/doctor/which.
 //! `main.rs` is a one-line wrapper around `run`.
 use std::collections::HashSet;
-use std::path::PathBuf;
 use std::fs;
 use std::io::IsTerminal as _;
+use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, ExitCode};
 
 use anyhow::{Context as _, anyhow, bail};
@@ -64,8 +64,8 @@ enum Command {
     /// Resolve a command name to the tool that provides it
     #[command(visible_alias = "w")]
     Which { command: String },
-    /// Print a tool's clone directory (cd via `cd "$(rig cd <tool>)"`)
-    Cd { tool: String },
+    /// Print a tool's clone directory, or rig's state dir if omitted
+    Cd { tool: Option<String> },
     /// Print a shell completion script for `rig` itself
     #[command(visible_alias = "c")]
     Completions { shell: clap_complete::Shell },
@@ -626,7 +626,7 @@ fn cmd_sync(force: bool) -> anyhow::Result<ExitCode> {
     // Unconditional: `sync`'s job is to regenerate init.zsh from the
     // current config even when no plugin needed cloning or backfilling.
     ctx.save()?;
-    write_own_completions(&ctx.layout)?;
+    write_own_completions(&ctx.config, &ctx.layout)?;
     report_tool_set_diff(&old_keys, &ctx.config);
     Ok(if failed {
         ExitCode::FAILURE
@@ -636,15 +636,48 @@ fn cmd_sync(force: bool) -> anyhow::Result<ExitCode> {
 }
 
 fn cmd_completions(shell: clap_complete::Shell) {
-    let mut cmd = <Cli as clap::CommandFactory>::command();
+    // Best-effort: without a readable config, tool names just don't complete.
+    let config = Ctx::load().ok().map(|ctx| ctx.config);
+    let mut cmd = completion_command(config.as_ref());
     let name = cmd.get_name().to_string();
     clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
 }
 
+/// Bakes configured tool names into the completion script as candidates.
+/// Only the generated script sees them; argument parsing stays open.
+fn completion_command(config: Option<&Config>) -> clap::Command {
+    let cmd = <Cli as clap::CommandFactory>::command();
+    let Some(config) = config else { return cmd };
+    let candidates = |cd_only: bool| {
+        let values: Vec<clap::builder::PossibleValue> = config::all_entries(config)
+            .into_iter()
+            .filter(|e| !cd_only || has_repo_dir(e))
+            .map(|e| {
+                let value = clap::builder::PossibleValue::new(e.key());
+                match e.description() {
+                    Some(desc) => value.help(desc.to_owned()),
+                    None => value,
+                }
+            })
+            .collect();
+        clap::builder::PossibleValuesParser::new(values)
+    };
+    let cmd = ["install", "update", "remove"]
+        .into_iter()
+        .fold(cmd, |cmd, sub| {
+            cmd.mut_subcommand(sub, |s| {
+                s.mut_arg("tools", |a| a.value_parser(candidates(false)))
+            })
+        });
+    cmd.mut_subcommand("cd", |s| {
+        s.mut_arg("tool", |a| a.value_parser(candidates(true)))
+    })
+}
+
 /// `rig` isn't installed via its own `[[repo]]`/`[[cargo]]` flow, so nothing
 /// else keeps its completions in `completions_dir` current — sync does it.
-fn write_own_completions(layout: &Layout) -> anyhow::Result<()> {
-    let mut cmd = <Cli as clap::CommandFactory>::command();
+fn write_own_completions(config: &Config, layout: &Layout) -> anyhow::Result<()> {
+    let mut cmd = completion_command(Some(config));
     let mut buf = Vec::new();
     clap_complete::generate(clap_complete::Shell::Zsh, &mut cmd, "rig", &mut buf);
     fs::create_dir_all(&layout.completions_dir)
@@ -728,8 +761,16 @@ fn cmd_doctor() -> anyhow::Result<()> {
 }
 
 /// Print the on-disk directory of a tool's clone (or extracted repo), so
-/// `cd "$(rig cd <tool>)"` jumps there.
-fn cmd_cd(tool: String) -> anyhow::Result<()> {
+/// `cd "$(rig cd <tool>)"` jumps there. No tool → rig's state dir.
+fn cmd_cd(tool: Option<String>) -> anyhow::Result<()> {
+    let Some(tool) = tool else {
+        let dir = Layout::state_dir(&paths::home_dir()?);
+        if !dir.is_dir() {
+            bail!("rig has no state yet — nothing at {}", dir.display());
+        }
+        println!("{}", dir.display());
+        return Ok(());
+    };
     let ctx = Ctx::load()?;
     let dir = resolve_cd_dir(&ctx.config, &ctx.lock, &ctx.layout, &tool)?;
     if !dir.is_dir() {
@@ -737,6 +778,14 @@ fn cmd_cd(tool: String) -> anyhow::Result<()> {
     }
     println!("{}", dir.display());
     Ok(())
+}
+
+/// The sources `resolve_cd_dir` can map to a directory of their own.
+fn has_repo_dir(entry: &ResolvedEntry) -> bool {
+    matches!(
+        entry,
+        ResolvedEntry::Repo(_) | ResolvedEntry::Git(_) | ResolvedEntry::Plugin(_)
+    )
 }
 
 /// Map a configured tool to its on-disk repo directory: the extracted
@@ -760,16 +809,16 @@ fn resolve_cd_dir(
             .ok_or_else(|| {
                 anyhow!("`{requested}` is not installed; run `rig install {requested}` first")
             }),
-        config::ResolvedEntry::Plugin(e) => {
-            Ok(layout.plugins_dir.join(config::tool_key(&e.name)))
-        }
+        config::ResolvedEntry::Plugin(e) => Ok(layout.plugins_dir.join(config::tool_key(&e.name))),
         config::ResolvedEntry::Cargo(_) => {
             bail!("`{requested}` is a cargo install — no repo directory")
         }
         config::ResolvedEntry::Node(_) => {
             bail!("`{requested}` is a node package — no repo directory")
         }
-        config::ResolvedEntry::Apt(_) => bail!("`{requested}` is an apt package — no repo directory"),
+        config::ResolvedEntry::Apt(_) => {
+            bail!("`{requested}` is an apt package — no repo directory")
+        }
         config::ResolvedEntry::Curl(_) => {
             bail!("`{requested}` is a curl install — no repo directory")
         }
@@ -798,10 +847,10 @@ fn cmd_which(command: String) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use crate::config::{
-        AptEntry, BinSpec, CargoEntry, Common, CurlEntry, GitEntry, Host, NodeEntry,
-        NodeManager, PluginEntry, RepoEntry,
+        AptEntry, BinSpec, CargoEntry, Common, CurlEntry, GitEntry, Host, NodeEntry, NodeManager,
+        PluginEntry, RepoEntry,
     };
-    use crate::lock::{test_tool_lock, ToolLock};
+    use crate::lock::{ToolLock, test_tool_lock};
     use std::path::Path;
 
     fn layout() -> Layout {
@@ -922,8 +971,7 @@ mod tests {
     fn rejects_unknown_and_not_yet_installed_tools() {
         let config = sample_config();
         let lock = Lock::default();
-        let err = resolve_cd_dir(&config, &lock, &layout(), "nope")
-            .expect_err("unknown tool");
+        let err = resolve_cd_dir(&config, &lock, &layout(), "nope").expect_err("unknown tool");
         assert!(err.to_string().contains("no configured tool"), "{err}");
 
         let err = resolve_cd_dir(&config, &lock, &layout(), "delta")
@@ -931,4 +979,40 @@ mod tests {
         assert!(err.to_string().contains("not installed"), "{err}");
     }
 
+    #[test]
+    fn completion_offers_tool_names_with_cd_limited_to_repo_dirs() {
+        let mut config = Config::default();
+        config.repo.push(repo_entry("dandavison/delta"));
+        config.cargo.push(CargoEntry {
+            name: "eza-community/eza".to_string(),
+            common: config::test_common(),
+        });
+        let mut buf = Vec::new();
+        let mut cmd = completion_command(Some(&config));
+        clap_complete::generate(clap_complete::Shell::Zsh, &mut cmd, "rig", &mut buf);
+        let script = String::from_utf8(buf).expect("utf8 completion script");
+
+        let tool_arg = |prefix: &str| {
+            script
+                .lines()
+                .find(|l| l.contains(prefix))
+                .unwrap_or_else(|| panic!("no `{prefix}` line in:\n{script}"))
+                .to_string()
+        };
+        let cd = tool_arg("'::tool");
+        assert!(cd.contains("delta") && !cd.contains("eza"), "{cd}");
+        let install = tool_arg("'*::tools");
+        assert!(
+            install.contains("delta") && install.contains("eza"),
+            "{install}"
+        );
+    }
+
+    #[test]
+    fn completion_parsing_still_accepts_unlisted_tools() {
+        let matches = Cli::command()
+            .try_get_matches_from(["rig", "cd", "not-in-config"])
+            .expect("the real parser has no possible-values restriction");
+        assert!(Cli::from_arg_matches(&matches).is_ok());
+    }
 }

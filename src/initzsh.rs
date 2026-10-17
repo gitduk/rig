@@ -131,11 +131,11 @@ fn render_rig_cmd_and_handler(out: &mut String, config: &Config, layout: &Layout
 
 
 # `rig cd` must change this shell's directory, which a subprocess can't do —
-# shadow rig here and delegate every other invocation to `command rig`.
+# shadow rig here and delegate every other invocation (flags too) to `command rig`.
 rig() {{
-  if [[ $1 == cd ]]; then
+  if [[ $1 == cd && ( $# -eq 1 || ( $# -eq 2 && $2 != -* ) ) ]]; then
     local dir
-    dir=$(command rig cd "$2") || return $?
+    dir=$(command rig cd "${{@:2}}") || return $?
     builtin cd -- "$dir"
   else
     command rig "$@"
@@ -647,15 +647,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn rig_cd_wrapper_changes_directory_in_the_loaded_shell() {
+    /// Sources a rendered init.zsh under a fake `rig` and runs `script`.
+    /// The fake echoes how it was called, so tests see what the wrapper passed.
+    fn run_rig_wrapper(script: &str) -> (std::path::PathBuf, String) {
         use std::fs;
         use std::process::Command;
 
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let home = tmp.path().join("home");
+        let tmp = tempfile::tempdir().expect("tempdir").keep();
+        let home = tmp.join("home");
         let layout = Layout::new(&home, "~/.local");
-        fs::create_dir_all(&home).expect("mkdir home");
         fs::create_dir_all(&layout.state_dir).expect("mkdir state dir");
 
         let mut config = Config::default();
@@ -663,16 +663,22 @@ mod tests {
         let out = render(&config, &Lock::default(), &layout);
         fs::write(&layout.init_zsh_path, &out).expect("write init.zsh");
 
-        // A fake `rig` on PATH: `cd` prints exactly the target path on stdout,
-        // like the real binary, so the wrapper's `$(...)` capture is clean.
-        let target = tmp.path().join("repo");
-        fs::create_dir_all(&target).expect("mkdir target");
-        let bin_dir = tmp.path().join("bin");
+        // `cd` prints exactly a path on stdout like the real binary, picked by
+        // args so tests can tell `rig cd` from `rig cd delta` from anything else.
+        let target = tmp.join("repo");
+        fs::create_dir_all(target.join("one")).expect("mkdir target");
+        let bin_dir = tmp.join("bin");
         fs::create_dir_all(&bin_dir).expect("mkdir bin");
         let fake_rig = bin_dir.join("rig");
         fs::write(
             &fake_rig,
-            format!("#!/bin/sh\n[ \"$1\" = cd ] && printf '%s\\n' '{}'\n", target.display()),
+            format!(
+                "#!/bin/sh\n\
+                 if [ \"$1\" = cd ] && [ $# -eq 1 ]; then printf '%s\\n' '{t}/one'\n\
+                 elif [ \"$1 $2\" = \"cd delta\" ] && [ $# -eq 2 ]; then printf '%s\\n' '{t}'\n\
+                 else echo \"passthrough $*\"; fi\n",
+                t = target.display()
+            ),
         )
         .expect("write fake rig");
         #[cfg(unix)]
@@ -682,16 +688,14 @@ mod tests {
                 .expect("chmod fake rig");
         }
 
-        let script = format!(
-            "source {}\nrig cd delta\npwd\n",
-            layout.init_zsh_path.display()
-        );
+        let script = format!("source {}\n{script}", layout.init_zsh_path.display());
         // Must not read ~/.zshenv: that can prepend ~/.local/bin to $PATH
         // and shadow the fake rig, so keep the session clean with --no-rcs.
         let output = Command::new("zsh")
             .arg("--no-rcs")
             .arg("-c")
             .arg(&script)
+            .current_dir(&tmp)
             .env(
                 "PATH",
                 format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap()),
@@ -700,13 +704,31 @@ mod tests {
             .expect("zsh -c should run");
         assert!(
             output.status.success(),
-            "rig cd failed:\n{}",
+            "wrapper script failed:\n{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        assert_eq!(
-            String::from_utf8_lossy(&output.stdout).trim(),
-            target.display().to_string(),
-            "rig cd should change the shell's cwd to the printed path"
-        );
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        fs::remove_dir_all(&tmp).expect("cleanup tempdir");
+        (target, stdout)
+    }
+
+    #[test]
+    fn rig_cd_wrapper_changes_directory_in_the_loaded_shell() {
+        let (target, stdout) = run_rig_wrapper("rig cd delta\npwd");
+        assert_eq!(stdout, target.display().to_string());
+    }
+
+    #[test]
+    fn rig_cd_wrapper_without_a_tool_still_changes_directory() {
+        let (target, stdout) = run_rig_wrapper("rig cd\npwd");
+        assert_eq!(stdout, target.join("one").display().to_string());
+    }
+
+    #[test]
+    fn rig_cd_wrapper_passes_flags_through_untouched() {
+        let (target, stdout) = run_rig_wrapper("rig cd --help\npwd");
+        let mut lines = stdout.lines();
+        assert_eq!(lines.next(), Some("passthrough cd --help"));
+        assert_ne!(lines.next(), Some(target.display().to_string().as_str()));
     }
 }
