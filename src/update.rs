@@ -90,7 +90,25 @@ pub fn update_all(
     filter: Option<&[String]>,
     verbose: bool,
 ) -> Vec<Report> {
-    let wanted = |key: &str| filter.is_none_or(|names| names.iter().any(|n| n == key));
+    // Resolve names like `rig install` does (key, full name or bin name);
+    // a name matching no entry must fail, not silently drop out.
+    let mut reports = Vec::new();
+    let keys: Option<Vec<String>> = filter.map(|names| {
+        names
+            .iter()
+            .filter_map(|n| match config::resolve_tool(config, n) {
+                Some(e) => Some(e.key()),
+                None => {
+                    reports.push(Report {
+                        tool: n.clone(),
+                        outcome: Err(anyhow!("{n} is not in {CONFIG_PATH_HINT}")),
+                    });
+                    None
+                }
+            })
+            .collect()
+    });
+    let wanted = |key: &str| keys.as_ref().is_none_or(|ks| ks.iter().any(|k| k == key));
     // Curl has no cheap staleness check, so an unfiltered `rig update`
     // would rerun every curl script each time; it only updates when named
     // explicitly (`rig update <tool>`) or via `rig install`'s folded
@@ -117,7 +135,6 @@ pub fn update_all(
     // thread merges every result as it arrives.
     let lock_snapshot = lock.clone();
 
-    let mut reports = Vec::new();
     pool::run_batched(
         serial,
         parallel,
@@ -535,6 +552,29 @@ mod tests {
         // never be fetched) and nothing reports.
         let reports = update_all(&config, &mut lock, &layout, false, false, None, false);
         assert!(reports.is_empty());
+    }
+
+    #[test]
+    fn update_all_reports_unknown_names_as_failures() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let layout = Layout::new(tmp.path(), "~/.local");
+        let config = Config::default();
+        let mut lock = Lock::default();
+
+        let filter = ["hi".to_string()];
+        let reports = update_all(
+            &config,
+            &mut lock,
+            &layout,
+            false,
+            false,
+            Some(&filter),
+            false,
+        );
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].tool, "hi");
+        let message = reports[0].outcome.as_ref().unwrap_err().to_string();
+        assert!(message.contains("not in ~/.rig.toml"));
     }
 
     #[test]
