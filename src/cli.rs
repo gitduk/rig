@@ -948,7 +948,9 @@ mod tests {
             bpick: None,
             extract: None,
             common: Common {
-                bin: Some(BinSpec::Single(name.split('/').last().unwrap().to_string())),
+                bin: Some(BinSpec::Single(
+                    name.split('/').next_back().unwrap().to_string(),
+                )),
                 ..config::test_common()
             },
         }

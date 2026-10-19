@@ -33,6 +33,20 @@ pub fn display_version(version: &str) -> &str {
     }
 }
 
+/// GET + parse, shared by all three version-lookup APIs — they differ only
+/// in the URL and the response type.
+pub(super) fn fetch_json<T: DeserializeOwned>(url: &str, what: &str) -> anyhow::Result<T> {
+    let text = ureq::get(url)
+        .header("User-Agent", USER_AGENT)
+        .call()
+        .with_context(|| format!("failed to query {url}"))?
+        .body_mut()
+        .read_to_string()
+        .with_context(|| format!("failed to read response body from {url}"))?;
+    serde_json::from_str(&text)
+        .with_context(|| format!("failed to parse {what} response from {url}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -69,18 +83,4 @@ mod tests {
         assert_eq!(display_version(""), "");
         assert_eq!(display_version("v"), "v");
     }
-}
-
-/// GET + parse, shared by all three version-lookup APIs — they differ only
-/// in the URL and the response type.
-pub(super) fn fetch_json<T: DeserializeOwned>(url: &str, what: &str) -> anyhow::Result<T> {
-    let text = ureq::get(url)
-        .header("User-Agent", USER_AGENT)
-        .call()
-        .with_context(|| format!("failed to query {url}"))?
-        .body_mut()
-        .read_to_string()
-        .with_context(|| format!("failed to read response body from {url}"))?;
-    serde_json::from_str(&text)
-        .with_context(|| format!("failed to parse {what} response from {url}"))
 }
