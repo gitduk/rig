@@ -30,7 +30,7 @@ fn registry_path(pkg: &str) -> String {
 pub fn latest(pkg: &str) -> anyhow::Result<NpmInfo> {
     let url = format!("https://registry.npmjs.org/{}/latest", registry_path(pkg));
 
-    let resp: NpmLatestResponse = fetch_json(&url, "npm registry")?;
+    let resp: NpmLatestResponse = fetch_json(&url, "npm registry", None)?;
 
     Ok(NpmInfo {
         version: resp.version,

@@ -1,6 +1,6 @@
 //! Version handling for install/update flows: the three lookup APIs
-//! (read-only HTTP GETs — no filesystem or process side effects), plus the
-//! sentinel and display helper they all feed.
+//! (read-only HTTP GETs — no filesystem side effects; the GitHub one may run
+//! `gh auth token`), plus the sentinel and display helper they all feed.
 
 pub mod crates_io;
 pub mod github;
@@ -34,10 +34,17 @@ pub fn display_version(version: &str) -> &str {
 }
 
 /// GET + parse, shared by all three version-lookup APIs — they differ only
-/// in the URL and the response type.
-pub(super) fn fetch_json<T: DeserializeOwned>(url: &str, what: &str) -> anyhow::Result<T> {
-    let text = ureq::get(url)
-        .header("User-Agent", USER_AGENT)
+/// in the URL, the response type, and whether a bearer token is sent.
+pub(super) fn fetch_json<T: DeserializeOwned>(
+    url: &str,
+    what: &str,
+    token: Option<&str>,
+) -> anyhow::Result<T> {
+    let mut request = ureq::get(url).header("User-Agent", USER_AGENT);
+    if let Some(token) = token {
+        request = request.header("Authorization", format!("Bearer {token}"));
+    }
+    let text = request
         .call()
         .with_context(|| format!("failed to query {url}"))?
         .body_mut()

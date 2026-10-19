@@ -18,7 +18,7 @@ struct CrateInfo {
 pub fn latest_version(name: &str) -> anyhow::Result<String> {
     let url = format!("https://crates.io/api/v1/crates/{name}");
 
-    let resp: CratesIoResponse = fetch_json(&url, "crates.io")?;
+    let resp: CratesIoResponse = fetch_json(&url, "crates.io", None)?;
 
     Ok(resp.krate.max_stable_version)
 }
