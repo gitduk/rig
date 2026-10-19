@@ -1,6 +1,6 @@
-//! Generates `init.zsh` — fpath, env, `RIG_CMD` + `command_not_found`,
-//! cached/live `eval` blocks, and the plugin load queue. Pure text
-//! assembly; writing the file is the caller's job.
+//! Generates `init.zsh` — fpath, a `compdef` queue, env, `RIG_CMD` +
+//! `command_not_found`, cached/live `eval` blocks, and the plugin load
+//! queue. Pure text assembly; writing the file is the caller's job.
 
 use std::collections::HashSet;
 
@@ -38,6 +38,7 @@ pub fn render(config: &Config, lock: &Lock, layout: &Layout) -> String {
 
     let mut out = String::new();
     render_fpath(&mut out, layout);
+    render_compdef_queue(&mut out);
     render_env(&mut out, &eager);
     render_run(&mut out, &eager);
     render_rig_cmd_and_handler(&mut out, config, layout);
@@ -52,6 +53,30 @@ fn render_fpath(out: &mut String, layout: &Layout) {
         "fpath=({} $fpath)\n\n",
         layout.completions_dir.display()
     ));
+}
+
+/// Sourced before compinit (fpath), so eval output's `compdef` gets queued
+/// and replayed at the first precmd after compinit — which may be deferred.
+fn render_compdef_queue(out: &mut String) {
+    out.push_str(
+        r#"if (( ! ${+functions[compdef]} )); then
+  typeset -ga _rig_compdef_queue
+  compdef() { _rig_compdef_queue+=("${(j: :)${(@q)@}}") }
+  typeset -g _rig_compdef_shim=$functions[compdef]
+  _rig_compdef_replay() {
+    (( ${+functions[compdef]} )) || return
+    [[ $functions[compdef] == $_rig_compdef_shim ]] && return
+    local call
+    for call in $_rig_compdef_queue; do eval "compdef $call"; done
+    unset _rig_compdef_queue _rig_compdef_shim
+    precmd_functions=(${precmd_functions:#_rig_compdef_replay})
+    unfunction _rig_compdef_replay
+  }
+  precmd_functions+=(_rig_compdef_replay)
+fi
+
+"#,
+    );
 }
 
 /// Rig, not the shell, is responsible for `~` expansion in `env`.
@@ -675,6 +700,51 @@ mod tests {
             result.status.success(),
             "zsh -n rejected generated init.zsh:\n{}\n--- output ---\n{out}",
             String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
+    /// Guarded (zoxide) and unguarded (clap) `compdef` both run before
+    /// compinit; the first precmd still sees rig's shim and must wait.
+    #[test]
+    fn compdef_before_compinit_is_replayed_after_it() {
+        use std::process::Command;
+
+        let mut config = Config::default();
+        config.repo.push(repo_entry(
+            "ajeetdsouza/zoxide",
+            Some(EvalSpec::Cmd("zoxide init zsh".to_string())),
+        ));
+        let mut lock = Lock::default();
+        lock.tool.insert(
+            "zoxide".to_string(),
+            tool_lock_with_eval(
+                Some(true),
+                Some(
+                    "_z_comp() {}\n\
+                     [[ \"${+functions[compdef]}\" -ne 0 ]] && \\compdef _z_comp j\n\
+                     compdef _z_comp 'two words' -p 'x*'"
+                        .to_string(),
+                ),
+            ),
+        );
+        let out = render(&config, &lock, &layout());
+
+        let script = format!(
+            "{out}\n\
+             for f in $precmd_functions; $f\n\
+             autoload -Uz compinit; compinit -D -u\n\
+             for f in $precmd_functions; $f\n\
+             print -r -- \"$_comps[j]|$_comps[two words]|${{+_patcomps[x*]}}|$precmd_functions\""
+        );
+        let output = Command::new("zsh")
+            .args(["--no-rcs", "-c", &script])
+            .output()
+            .expect("zsh -c should run");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success() && stderr.is_empty(), "{stderr}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "_z_comp|_z_comp|1|"
         );
     }
 

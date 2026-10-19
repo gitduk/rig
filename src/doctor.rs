@@ -58,7 +58,6 @@ pub fn run(config: &Config, lock: &Lock, layout: &Layout) -> Vec<Finding> {
     findings.extend(check_foreign_prefix_bin(config, lock, layout));
     findings.extend(check_shadowed_completions(lock, SYSTEM_COMPLETION_DIRS));
     findings.extend(check_sudo_in_setup(config));
-    findings.extend(check_unguarded_compdef(lock));
     findings.extend(check_dual_node_managers(config, layout));
     findings.extend(check_eval_cache_drift(config, lock));
     findings
@@ -314,22 +313,6 @@ fn setup_uses_sudo(setup: &SetupSpec) -> bool {
         .any(|c| c.split_whitespace().any(|w| w == "sudo"))
 }
 
-fn check_unguarded_compdef(lock: &Lock) -> Vec<Finding> {
-    let mut findings = Vec::new();
-    for (key, tool) in &lock.tool {
-        let Some(output) = &tool.eval_cached_output else {
-            continue;
-        };
-        if output.contains("compdef") && !output.contains("functions[compdef]") {
-            findings.push(warn(format!(
-                "{key}'s cached eval output calls `compdef` without a guard \
-                 — must stay after compinit"
-            )));
-        }
-    }
-    findings
-}
-
 fn check_dual_node_managers(config: &Config, layout: &Layout) -> Vec<Finding> {
     if config.node.is_empty() {
         return Vec::new();
@@ -532,22 +515,5 @@ mod tests {
         assert!(!setup_uses_sudo(&SetupSpec::Single(
             "cargo build --release".to_string()
         )));
-    }
-
-    #[test]
-    fn flags_compdef_without_a_guard() {
-        let mut lock = Lock::default();
-        let mut unguarded = lock::test_tool_lock();
-        unguarded.eval_cached_output = Some("compdef _foo foo".to_string());
-        lock.tool.insert("foo".to_string(), unguarded);
-
-        let mut guarded = lock::test_tool_lock();
-        guarded.eval_cached_output =
-            Some("[[ ${+functions[compdef]} -ne 0 ]] && compdef _bar bar".to_string());
-        lock.tool.insert("bar".to_string(), guarded);
-
-        let findings = check_unguarded_compdef(&lock);
-        assert_eq!(findings.len(), 1);
-        assert!(findings[0].message.contains("foo"));
     }
 }
