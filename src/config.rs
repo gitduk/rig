@@ -1,5 +1,5 @@
-//! `config.toml` schema, including `ResolvedEntry` for code that needs to
-//! work across all six `[[source]]` vectors uniformly.
+//! `~/.rig.toml` schema, including `ResolvedEntry` for code that needs to
+//! work across all seven `[[source]]` vectors uniformly.
 
 use std::collections::HashMap;
 use std::fs;
@@ -7,6 +7,8 @@ use std::path::Path;
 
 use anyhow::{Context, bail};
 use serde::Deserialize;
+
+use crate::paths::CONFIG_PATH_HINT;
 
 #[derive(Debug, Default, Deserialize)]
 pub struct Config {
@@ -399,7 +401,8 @@ pub fn resolve_tool<'a>(config: &'a Config, requested: &str) -> Option<ResolvedE
 }
 
 pub fn parse(input: &str) -> anyhow::Result<Config> {
-    let config: Config = toml::from_str(input).context("failed to parse config.toml")?;
+    let config: Config =
+        toml::from_str(input).with_context(|| format!("failed to parse {CONFIG_PATH_HINT}"))?;
     check_unique_keys(&config)?;
     Ok(config)
 }

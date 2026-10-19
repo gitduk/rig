@@ -15,7 +15,7 @@ use crate::doctor;
 use crate::initzsh;
 use crate::lock::{self, Lock, ToolLock};
 use crate::output;
-use crate::paths::{self, Layout};
+use crate::paths::{self, CONFIG_PATH_HINT, Layout};
 use crate::pool;
 use crate::remove;
 use crate::sources;
@@ -39,7 +39,7 @@ enum Command {
         #[arg(short, long)]
         verbose: bool,
     },
-    /// Update tools (omit to update everything in config.toml)
+    /// Update tools (omit to update everything in ~/.rig.toml)
     #[command(visible_alias = "u")]
     Update {
         tools: Vec<String>,
@@ -368,7 +368,7 @@ fn install_one(
     requested: &str,
 ) -> anyhow::Result<(String, InstallOutcome)> {
     let resolved = config::resolve_tool(config, requested)
-        .ok_or_else(|| anyhow!("{requested} is not in config.toml"))?;
+        .ok_or_else(|| anyhow!("{requested} is not in {CONFIG_PATH_HINT}"))?;
     let key = resolved.key();
 
     // Skip only if genuinely healthy — a dangling bin must still fall
@@ -773,7 +773,7 @@ fn write_own_completions(config: &Config, layout: &Layout) -> anyhow::Result<()>
 }
 
 /// `rig sync` can fire unattended on shell startup — this is the only
-/// feedback that a manual `config.toml` edit actually took effect.
+/// feedback that a manual `~/.rig.toml` edit actually took effect.
 fn report_tool_set_diff(old_keys: &std::collections::HashSet<String>, config: &Config) {
     let new_keys: std::collections::HashSet<String> = config::all_entries(config)
         .into_iter()

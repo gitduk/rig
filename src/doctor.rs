@@ -11,7 +11,7 @@ use std::process::Command;
 use crate::config::{self, Config, SetupSpec};
 use crate::evalcache;
 use crate::lock::Lock;
-use crate::paths::Layout;
+use crate::paths::{CONFIG_PATH_HINT, Layout};
 
 const SYSTEM_COMPLETION_DIRS: &[&str] = &[
     "/usr/share/zsh/functions/Completion",
@@ -64,7 +64,7 @@ pub fn run(config: &Config, lock: &Lock, layout: &Layout) -> Vec<Finding> {
     findings
 }
 
-/// The shell's stale-guard condition, checked manually: if `config.toml` is
+/// The shell's stale-guard condition, checked manually: if `~/.rig.toml` is
 /// newer than the generated `init.zsh`, a shell hasn't re-synced since the edit.
 fn check_config_newer_than_init_zsh(layout: &Layout) -> Vec<Finding> {
     let (Ok(config_meta), Ok(init_meta)) = (
@@ -78,10 +78,10 @@ fn check_config_newer_than_init_zsh(layout: &Layout) -> Vec<Finding> {
     };
 
     if config_mtime > init_mtime {
-        vec![warn(
-            "config.toml changed since the last `rig sync` — run `rig sync` to \
-             pick up new tools",
-        )]
+        vec![warn(format!(
+            "{CONFIG_PATH_HINT} changed since the last `rig sync` — run `rig sync` to \
+             pick up new tools"
+        ))]
     } else {
         Vec::new()
     }

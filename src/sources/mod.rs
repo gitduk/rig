@@ -24,7 +24,7 @@ use sha2::{Digest, Sha256};
 use crate::config::{BinSpec, BpickSpec, Common, CompletionsSpec, EvalSpec, SetupSpec};
 use crate::lock::Lock;
 use crate::output::warning;
-use crate::paths;
+use crate::paths::{self, CONFIG_PATH_HINT};
 use crate::version::display_version;
 use crate::version::github::Asset;
 
@@ -34,10 +34,6 @@ pub use crate::config::tool_key;
 /// Shared HTTP client identity — `curl.rs`, `version/*`, and `download`
 /// all speak for the same program.
 pub const USER_AGENT: &str = concat!("rig/", env!("CARGO_PKG_VERSION"));
-
-/// `Layout::new` hardcodes this same path unconditionally — no override
-/// mechanism exists, so error messages can name it as a literal.
-const CONFIG_PATH_HINT: &str = "~/.rig.toml";
 
 /// Shared by `git.rs` (post-clone, before symlinking) and `plugin.rs`
 /// (post-clone/pull, as the plugin's own version marker).

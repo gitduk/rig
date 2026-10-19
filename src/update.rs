@@ -11,7 +11,7 @@ use crate::config::{
     ResolvedEntry,
 };
 use crate::lock::{self, Lock, ToolLock};
-use crate::paths::Layout;
+use crate::paths::{CONFIG_PATH_HINT, Layout};
 use crate::pool;
 use crate::sources;
 use crate::version;
@@ -173,7 +173,7 @@ fn update_one(
     refresh_eval: bool,
 ) -> anyhow::Result<(Outcome, Option<LockChange>)> {
     let entry = config::resolve_tool(config, name)
-        .ok_or_else(|| anyhow!("{name} is not in config.toml"))?;
+        .ok_or_else(|| anyhow!("{name} is not in {CONFIG_PATH_HINT}"))?;
     let key = entry.key();
     if refresh_eval {
         refresh_eval_cache(&entry, &key, lock)

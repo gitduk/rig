@@ -6,6 +6,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 
+/// `Layout::new` hardcodes this same path unconditionally — no override
+/// mechanism exists, so error messages can name it as a literal.
+pub const CONFIG_PATH_HINT: &str = "~/.rig.toml";
+
 pub fn home_dir() -> anyhow::Result<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
