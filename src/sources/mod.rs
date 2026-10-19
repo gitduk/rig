@@ -11,7 +11,7 @@ pub mod node;
 pub mod plugin;
 pub mod repo;
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
@@ -55,7 +55,7 @@ pub fn git_head_commit(repo_dir: &Path) -> anyhow::Result<String> {
 
 /// Applies configured `env` to an install subprocess — never inherit-only,
 /// or install location depends on the caller's shell.
-pub fn apply_env(cmd: &mut Command, env: &HashMap<String, String>) -> anyhow::Result<()> {
+pub fn apply_env(cmd: &mut Command, env: &BTreeMap<String, String>) -> anyhow::Result<()> {
     if env.is_empty() {
         return Ok(());
     }
@@ -666,7 +666,7 @@ pub fn collect_completions(
     link_root: &Path,
     spec: &CompletionsSpec,
     completions_dir: &Path,
-    env: &HashMap<String, String>,
+    env: &BTreeMap<String, String>,
 ) -> anyhow::Result<Vec<PathBuf>> {
     match spec {
         CompletionsSpec::Enabled(false) => Ok(Vec::new()),
@@ -759,7 +759,7 @@ pub fn run_setup(
     spec: &SetupSpec,
     cwd: &Path,
     phase: Phase,
-    env: &HashMap<String, String>,
+    env: &BTreeMap<String, String>,
 ) -> anyhow::Result<()> {
     match spec {
         SetupSpec::Single(cmd) => run_shell(cmd, cwd, env),
@@ -794,7 +794,7 @@ fn mentions_sudo(cmd: &str) -> bool {
 
 /// Hooks that reach outside rig's control (via `sudo`) are allowed, but
 /// must not be silent about it.
-fn run_shell(cmd: &str, cwd: &Path, env: &HashMap<String, String>) -> anyhow::Result<()> {
+fn run_shell(cmd: &str, cwd: &Path, env: &BTreeMap<String, String>) -> anyhow::Result<()> {
     if mentions_sudo(cmd) {
         warning!(
             "warning: setup hook runs `sudo` — writes outside rig's control, \
@@ -944,7 +944,7 @@ mod tests {
 
     #[test]
     fn apply_env_sets_and_expands_tilde_values() {
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         map.insert("RIG_TEST_PLAIN".to_string(), "hello".to_string());
         map.insert("RIG_TEST_TILDE".to_string(), "~/.local".to_string());
 
@@ -1105,7 +1105,7 @@ mod tests {
         // A same-named decoy elsewhere must not satisfy the path-qualified pattern.
         fs::write(unpacked.join("wallust"), b"decoy").expect("write decoy");
 
-        let mut map = std::collections::HashMap::new();
+        let mut map = std::collections::BTreeMap::new();
         map.insert("target/release/wallust".to_string(), "wallust".to_string());
         let bin_spec = BinSpec::Mapped(map);
 
@@ -1442,7 +1442,7 @@ mod tests {
     #[test]
     fn run_shell_stops_at_the_first_failing_command() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let err = run_shell("false; touch reached", tmp.path(), &HashMap::new())
+        let err = run_shell("false; touch reached", tmp.path(), &BTreeMap::new())
             .expect_err("`false` must fail the hook");
         assert!(err.to_string().contains("setup command"), "{err}");
         assert!(!tmp.path().join("reached").exists());

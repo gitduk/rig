@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use serde::Deserialize;
 
@@ -6,14 +6,14 @@ use super::fetch_json;
 
 pub struct NpmInfo {
     pub version: String,
-    pub bin: HashMap<String, String>,
+    pub bin: BTreeMap<String, String>,
 }
 
 #[derive(Deserialize)]
 struct NpmLatestResponse {
     version: String,
     #[serde(default)]
-    bin: HashMap<String, String>,
+    bin: BTreeMap<String, String>,
 }
 
 /// Scoped package names (`@scope/name`) need the `/` percent-encoded to stay

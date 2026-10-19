@@ -1,7 +1,7 @@
 //! `[[git]]` install flow — source build via a locally invoked `git`
 //! binary (SIM-1: no `git2`, `git` is already on the system).
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -47,7 +47,7 @@ pub fn remote_head_commit(host: Host, name: &str) -> anyhow::Result<String> {
         .context("git ls-remote returned no output")
 }
 
-fn git_clone(url: &str, dest: &Path, env: &HashMap<String, String>) -> anyhow::Result<()> {
+fn git_clone(url: &str, dest: &Path, env: &BTreeMap<String, String>) -> anyhow::Result<()> {
     let mut command = Command::new("git");
     command.args(["clone", "--quiet", url]).arg(dest);
     apply_env(&mut command, env)?;

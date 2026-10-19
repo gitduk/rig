@@ -1,7 +1,7 @@
 //! `~/.rig.toml` schema, including `ResolvedEntry` for code that needs to
 //! work across all seven `[[source]]` vectors uniformly.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::Path;
 
@@ -56,7 +56,7 @@ pub struct Common {
     pub description: Option<String>,
     pub bin: Option<BinSpec>,
     #[serde(default)]
-    pub env: HashMap<String, String>,
+    pub env: BTreeMap<String, String>,
     pub eval: Option<EvalSpec>,
     /// Plain shell text (e.g. `alias js="just"`) run verbatim, never
     /// captured like `eval`. `lazy` below defers it the same way.
@@ -80,7 +80,7 @@ pub fn test_common() -> Common {
     Common {
         description: None,
         bin: None,
-        env: HashMap::new(),
+        env: BTreeMap::new(),
         eval: None,
         run: None,
         completions: default_completions(),
@@ -96,7 +96,7 @@ pub fn test_common() -> Common {
 pub enum BinSpec {
     Single(String),
     Multiple(Vec<String>),
-    Mapped(HashMap<String, String>),
+    Mapped(BTreeMap<String, String>),
 }
 
 impl BinSpec {

@@ -275,7 +275,7 @@ mod tests {
     use super::*;
     use crate::config::{self, EvalSpec, Host, PluginEntry, RepoEntry, RunSpec};
     use crate::lock::ToolLock;
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
     use std::path::Path;
     use time::OffsetDateTime;
 
@@ -298,7 +298,7 @@ mod tests {
 
     fn lazy_repo_entry(
         name: &str,
-        env: HashMap<String, String>,
+        env: BTreeMap<String, String>,
         eval: Option<EvalSpec>,
         bind: Option<&str>,
     ) -> RepoEntry {
@@ -319,7 +319,7 @@ mod tests {
 
     #[test]
     fn lazy_tool_defers_env_and_eval_into_a_stub_function() {
-        let mut env = HashMap::new();
+        let mut env = BTreeMap::new();
         env.insert("ATUIN_TMUX_POPUP".to_string(), "false".to_string());
         let mut config = Config::default();
         config.repo.push(lazy_repo_entry(
@@ -352,7 +352,7 @@ mod tests {
         let mut config = Config::default();
         config.repo.push(lazy_repo_entry(
             "atuinsh/atuin",
-            HashMap::new(),
+            BTreeMap::new(),
             Some(EvalSpec::Cmd("atuin init zsh".to_string())),
             None,
         ));
@@ -367,7 +367,7 @@ mod tests {
         let mut config = Config::default();
         config.repo.push(lazy_repo_entry(
             "denisidoro/navi",
-            HashMap::new(),
+            BTreeMap::new(),
             Some(EvalSpec::Cmd("navi widget zsh".to_string())),
             Some("^g:_navi_widget"),
         ));
@@ -454,6 +454,37 @@ mod tests {
         assert!(lines.contains(&"_rig_lazy_init_delta() {"));
         assert!(lines.contains(&"  alias d=delta"));
         assert!(lines.contains(&"  alias dd=\"delta --diff-so-fancy\""));
+    }
+
+    /// A no-op sync must render byte-identical text, or every shell
+    /// start rewrites init.zsh (and its backup) for nothing.
+    #[test]
+    fn env_and_mapped_bins_render_in_key_order() {
+        let mut config = Config::default();
+        config.repo.push(RepoEntry {
+            name: "Nukesor/pueue".to_string(),
+            host: Host::Github,
+            bpick: None,
+            extract: None,
+            common: Common {
+                env: ["Z_VAR", "A_VAR", "M_VAR"]
+                    .map(|k| (k.to_string(), "1".to_string()))
+                    .into(),
+                bin: Some(BinSpec::Mapped(
+                    [("pueued*-musl", "pueued"), ("pueue*-musl", "pueue")]
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .into(),
+                )),
+                ..config::test_common()
+            },
+        });
+
+        let out = render(&config, &Lock::default(), &layout());
+        let pos = |needle: &str| out.find(needle).expect(needle);
+
+        assert!(pos("export A_VAR") < pos("export M_VAR"));
+        assert!(pos("export M_VAR") < pos("export Z_VAR"));
+        assert!(pos("  pueue pueue\n") < pos("  pueued pueue\n"));
     }
 
     #[test]
@@ -588,7 +619,7 @@ mod tests {
                 "ZSH_AUTOSUGGEST_STRATEGY=(match_prev_cmd history)".to_string(),
             )),
         });
-        let mut env = HashMap::new();
+        let mut env = BTreeMap::new();
         env.insert("ATUIN_TMUX_POPUP".to_string(), "false".to_string());
         config.repo.push(lazy_repo_entry(
             "atuinsh/atuin",
