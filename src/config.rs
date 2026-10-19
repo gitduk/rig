@@ -262,7 +262,7 @@ pub enum NodeManager {
     Npm,
 }
 
-/// `[[apt]]`: system package via apt-get; `rig update` reruns the install (no version pre-check).
+/// `[[apt]]`: system package via apt-get; `rig update` reinstalls when apt's candidate differs.
 #[derive(Debug, Deserialize)]
 pub struct AptEntry {
     pub name: String,

@@ -1,6 +1,6 @@
-//! `[[apt]]`: system packages via `apt-get`. `rig update` reruns the
-//! install (no cheap version pre-check — apt itself is the version
-//! source). dpkg owns file placement system-wide, so there's no
+//! `[[apt]]`: system packages via `apt-get`. `rig update` compares the
+//! locked version against apt's local candidate and only reruns the install
+//! (under sudo) when they differ. dpkg owns file placement system-wide, so there's no
 //! `pkg/<tool>/<version>` tree here and no symlinks for rig to create; it
 //! just records what dpkg reports.
 
@@ -16,7 +16,7 @@ use crate::paths::Layout;
 use crate::output::{progress, warning};
 
 use super::{
-    Phase, apply_env, collect_completions, resolve_declared_bins, run_child, run_setup, tool_key,
+    Phase, apply_env, collect_completions, resolve_declared_bins, run_child_in, run_setup, tool_key,
 };
 
 pub fn install(entry: &AptEntry, layout: &Layout, phase: Phase) -> anyhow::Result<ToolLock> {
@@ -34,10 +34,12 @@ pub fn install(entry: &AptEntry, layout: &Layout, phase: Phase) -> anyhow::Resul
     let mut command = Command::new("sudo");
     command.args(["apt-get", "install", "-y"]).arg(&entry.name);
     apply_env(&mut command, &entry.common.env)?;
-    // `needs_terminal` keeps apt streaming, so sudo's prompt reaches the terminal.
-    run_child(
+    // sudo prompts on /dev/tty, so capturing apt's chatter on update keeps
+    // the prompt visible; a fresh install still streams its progress.
+    run_child_in(
         &mut command,
         &format!("`sudo apt-get install -y {}`", entry.name),
+        crate::output::streaming() && matches!(phase, Phase::Install),
     )?;
 
     let version = dpkg_version(&entry.name)?;
@@ -103,4 +105,50 @@ fn dpkg_version(package: &str) -> anyhow::Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// The version `apt-get install` would land, from the local package index
+/// (no sudo, no network). `None` when apt has no candidate or can't be read.
+pub fn candidate_version(package: &str) -> Option<String> {
+    let output = Command::new("apt-cache")
+        .args(["policy", package])
+        .env("LC_ALL", "C")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_candidate(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_candidate(policy: &str) -> Option<String> {
+    policy
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("Candidate:"))
+        .map(str::trim)
+        .filter(|v| !v.is_empty() && *v != "(none)")
+        .map(str::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_candidate_from_policy_output() {
+        let policy = "git:\n  Installed: 1:2.53.0-1ubuntu1\n  Candidate: 1:2.53.0-1ubuntu2\n";
+        assert_eq!(
+            parse_candidate(policy).as_deref(),
+            Some("1:2.53.0-1ubuntu2")
+        );
+    }
+
+    #[test]
+    fn no_candidate_when_apt_has_none() {
+        assert_eq!(
+            parse_candidate("foo:\n  Installed: (none)\n  Candidate: (none)\n"),
+            None
+        );
+        assert_eq!(parse_candidate(""), None);
+    }
 }

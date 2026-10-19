@@ -1,7 +1,7 @@
 //! Update flow, reusing each source type's `sources::*::install`.
 //! repo/git/cargo/node check a cheap version query against `rig.lock`
-//! first and skip when current; apt always reinstalls (a no-op when
-//! current) and diffs the version; curl always reruns, so an unfiltered
+//! first and skip when current; apt compares against its local candidate
+//! the same way; curl always reruns, so an unfiltered
 //! `rig update` skips it — only `rig update <tool>` reaches it.
 
 use anyhow::{anyhow, bail};
@@ -36,6 +36,9 @@ pub enum Outcome {
     },
     /// `rig sync --force` on a tool with no `eval` configured.
     NoEval,
+    /// Blanket run only: configured but absent from `rig.lock` — maybe
+    /// installed by other means, so it's skipped rather than failed.
+    NotInstalled,
 }
 
 pub struct Report {
@@ -112,9 +115,16 @@ pub fn update_all(
     // Curl has no cheap staleness check, so an unfiltered `rig update`
     // would rerun every curl script each time; it only updates when named
     // explicitly (`rig update <tool>`) or via `rig install`'s folded
-    // check. apt stays in the blanket run — its reinstall is a no-op when
-    // the version is unchanged.
+    // check. apt stays in the blanket run — its candidate check is cheap.
     let blanket = filter.is_none();
+    // A blanket run can't tell "never installed" from "installed outside
+    // rig", so neither is a failure; named tools still error. An untracked
+    // plugin clone still goes through, for its `rig sync` hint.
+    let tracked = |e: &ResolvedEntry<'_>| {
+        let key = e.key();
+        lock.tool.contains_key(&key)
+            || (matches!(e, ResolvedEntry::Plugin(_)) && layout.plugins_dir.join(&key).exists())
+    };
     // Collect (key, full name): the key feeds the report, but `resolve_tool`
     // also matches declared bin names, so a key can hit a different entry
     // whose `bin` shares it — only the full name is unambiguous.
@@ -123,6 +133,16 @@ pub fn update_all(
     let (serial, parallel): (Vec<_>, Vec<_>) = config::all_entries(config)
         .into_iter()
         .filter(|e| wanted(&e.key()) && !(blanket && matches!(e, ResolvedEntry::Curl(_))))
+        .filter(|e| {
+            let skip = blanket && !tracked(e);
+            if skip {
+                reports.push(Report {
+                    tool: e.key(),
+                    outcome: Ok(Outcome::NotInstalled),
+                });
+            }
+            !skip
+        })
         .partition(|e| e.needs_terminal());
     let as_target = |e: ResolvedEntry<'_>| (e.key(), e.name().to_string());
     let serial: Vec<(String, String)> = serial.into_iter().map(as_target).collect();
@@ -229,7 +249,7 @@ fn refresh_eval_cache(
     lock: &Lock,
 ) -> anyhow::Result<(Outcome, Option<LockChange>)> {
     if !lock.tool.contains_key(key) {
-        bail!("{key} is not installed; run `rig install {key}` first");
+        return Err(not_installed(key));
     }
     let Some(eval) = entry.common().and_then(|c| c.eval.as_ref()) else {
         return Ok((Outcome::NoEval, None));
@@ -249,11 +269,16 @@ fn refresh_eval_cache(
     ))
 }
 
+/// Absent from `rig.lock` — the binary may still exist, installed by other means.
+fn not_installed(key: &str) -> anyhow::Error {
+    anyhow!("{key} is not installed by rig; run `rig install {key}` to manage it")
+}
+
 fn already_installed(lock: &Lock, key: &str) -> anyhow::Result<String> {
     lock.tool
         .get(key)
         .map(|t| t.version.clone())
-        .ok_or_else(|| anyhow!("{key} is not installed; run `rig install {key}` first"))
+        .ok_or_else(|| not_installed(key))
 }
 
 fn update_repo(
@@ -376,10 +401,7 @@ fn update_node(
     layout: &Layout,
     force: bool,
 ) -> anyhow::Result<(Outcome, Option<LockChange>)> {
-    let current = lock
-        .tool
-        .get(key)
-        .ok_or_else(|| anyhow!("{key} is not installed; run `rig install {key}` first"))?;
+    let current = lock.tool.get(key).ok_or_else(|| not_installed(key))?;
     let current_version = current.version.clone();
     let manager = sources::node::ResolvedManager::parse(
         current
@@ -417,8 +439,8 @@ fn update_node(
     ))
 }
 
-/// No cheap pre-check exists, so this always runs `apt-get install` (a
-/// no-op if current) and diffs `dpkg-query` before/after for the outcome.
+/// apt's local candidate is the pre-check, so a current package never
+/// touches sudo. No readable candidate falls back to rerunning the install.
 fn update_apt(
     entry: &AptEntry,
     key: &str,
@@ -426,6 +448,14 @@ fn update_apt(
     layout: &Layout,
 ) -> anyhow::Result<(Outcome, Option<LockChange>)> {
     let current_version = already_installed(lock, key)?;
+    if sources::apt::candidate_version(&entry.name).as_deref() == Some(current_version.as_str()) {
+        return Ok((
+            Outcome::UpToDate {
+                version: current_version,
+            },
+            None,
+        ));
+    }
 
     let new_lock = sources::apt::install(
         entry,
@@ -485,7 +515,7 @@ fn update_plugin(
         None if layout.plugins_dir.join(key).exists() => {
             bail!("{key} is cloned but not yet tracked in rig.lock; run `rig sync` first")
         }
-        None => bail!("{key} is not installed; run `rig install {key}` first"),
+        None => return Err(not_installed(key)),
     };
 
     let new_lock = sources::plugin::update(entry, layout)?;
@@ -552,6 +582,37 @@ mod tests {
         // never be fetched) and nothing reports.
         let reports = update_all(&config, &mut lock, &layout, false, false, None, false);
         assert!(reports.is_empty());
+    }
+
+    #[test]
+    fn update_all_skips_untracked_tools_on_blanket_runs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let layout = Layout::new(tmp.path(), "~/.local");
+        let mut config = Config::default();
+        config.apt.push(AptEntry {
+            name: "nala".to_string(),
+            common: config::test_common(),
+        });
+        let mut lock = Lock::default();
+
+        // Blanket: skipped, never reaching apt-get.
+        let reports = update_all(&config, &mut lock, &layout, false, false, None, false);
+        assert_eq!(reports.len(), 1);
+        assert!(matches!(reports[0].outcome, Ok(Outcome::NotInstalled)));
+
+        // Named: still an error, pointing at `rig install`.
+        let filter = ["nala".to_string()];
+        let reports = update_all(
+            &config,
+            &mut lock,
+            &layout,
+            false,
+            false,
+            Some(&filter),
+            false,
+        );
+        let message = reports[0].outcome.as_ref().unwrap_err().to_string();
+        assert!(message.contains("not installed by rig"));
     }
 
     #[test]

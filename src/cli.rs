@@ -496,6 +496,14 @@ fn print_reports(reports: &[update::Report], fold_up_to_date: bool, elapsed: Dur
         .iter()
         .filter_map(|r| Some((r.tool.as_str(), r.outcome.as_ref().ok()?)))
         .filter(|(_, o)| !(fold && matches!(o, update::Outcome::UpToDate { .. })))
+        .filter(|(_, o)| !matches!(o, update::Outcome::NotInstalled))
+        .collect();
+    // One line for all of them: a config full of tools installed elsewhere
+    // would otherwise bury the real results.
+    let not_installed: Vec<&str> = ok
+        .iter()
+        .filter(|r| matches!(r.outcome, Ok(update::Outcome::NotInstalled)))
+        .map(|r| r.tool.as_str())
         .collect();
 
     let color = color_enabled(&std::io::stdout());
@@ -514,6 +522,12 @@ fn print_reports(reports: &[update::Report], fold_up_to_date: bool, elapsed: Dur
             println!("{label:<width$} {text}");
         }
     }
+    if !not_installed.is_empty() {
+        println!(
+            "not installed by rig (skipped): {} — `rig install <tool>` to manage",
+            not_installed.join(", ")
+        );
+    }
     for report in &failed {
         if let Err(e) = &report.outcome {
             print_error(Some(&report.tool), e);
@@ -528,7 +542,8 @@ fn print_reports(reports: &[update::Report], fold_up_to_date: bool, elapsed: Dur
             Ok(update::Outcome::EvalRefreshed { .. }) => (2, "eval refreshed"),
             Ok(update::Outcome::NoEval) => (3, "no eval"),
             Ok(update::Outcome::UpToDate { .. }) => (4, "up to date"),
-            Err(_) => (5, "failed"),
+            Ok(update::Outcome::NotInstalled) => (5, "not installed"),
+            Err(_) => (6, "failed"),
         };
         let mut tally: BTreeMap<(u8, &str), usize> = BTreeMap::new();
         for report in &reports {
@@ -567,6 +582,7 @@ fn describe_outcome(outcome: &update::Outcome) -> String {
             format!("eval refreshed ({label})")
         }
         update::Outcome::NoEval => "no eval configured, nothing to refresh".to_string(),
+        update::Outcome::NotInstalled => "not installed by rig, skipped".to_string(),
     }
 }
 
