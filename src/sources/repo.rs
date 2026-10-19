@@ -73,7 +73,7 @@ pub fn install(
         tool,
         &asset.url,
         &cache_path,
-        asset.size,
+        Some(asset.size),
         asset.digest.as_deref(),
     )
     .with_context(|| format!("failed to download {}", asset.name))?;

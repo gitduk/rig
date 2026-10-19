@@ -27,9 +27,16 @@
 - Update progress lines show both versions: `updating 1.58.0 -> 1.59.0`.
 - `[[apt]]` tools run first, one at a time, with the terminal attached so
   `sudo` can prompt.
+- `rig update --self` no longer uses the GitHub API, so it can't hit the
+  60 requests/hour anonymous limit. It reads the latest tag from the
+  release page redirect and checks the archive against its `.sha256` file.
 
 ### Added
 
 - `-v` / `--verbose` on `rig install` and `rig update`: stream every step
   and child output live, as before. A single tool, or non-terminal output,
   streams by default.
+- GitHub release lookups send a token from `GITHUB_TOKEN`, `GH_TOKEN`, or
+  `gh auth token`, raising the API limit from 60 to 5000 requests/hour.
+- `rig update --self` and the `rig.zsh` bootstrap support aarch64 Linux and
+  x86_64/aarch64 macOS, not just x86_64 Linux.

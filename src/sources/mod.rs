@@ -221,14 +221,15 @@ pub fn glob_match(pattern: &str, name: &str) -> bool {
 }
 
 /// Downloads to `dest`, streaming through a sha256 while copying. Verifies
-/// `expected_size` always; when the host published a `digest`, the hash too
+/// `expected_size` (else the Content-Length, when sent); when the host
+/// published a `digest`, the hash too
 /// — a mismatch means the asset was replaced upstream or corrupted in
 /// transit, not just truncated.
 pub fn download(
     tool: &str,
     url: &str,
     dest: &Path,
-    expected_size: u64,
+    expected_size: Option<u64>,
     digest: Option<&str>,
 ) -> anyhow::Result<()> {
     if let Some(parent) = dest.parent() {
@@ -240,6 +241,7 @@ pub fn download(
         .header("User-Agent", USER_AGENT)
         .call()
         .with_context(|| format!("failed to download {url}"))?;
+    let expected_size = expected_size.or(response.body().content_length());
 
     let mut file =
         fs::File::create(dest).with_context(|| format!("failed to create {}", dest.display()))?;
@@ -260,7 +262,9 @@ pub fn download(
         written += n as u64;
     }
 
-    if written != expected_size {
+    if let Some(expected_size) = expected_size
+        && written != expected_size
+    {
         bail!(
             "downloaded {written} bytes from {url}, expected {expected_size} \
              (truncated download or asset changed upstream)"
@@ -275,7 +279,7 @@ pub fn download(
 }
 
 /// `sha256:<hex>` is the only shape seen in the wild (GitHub emits it,
-/// Codeberg doesn't). Unknown algorithms degrade to size-only checking,
+/// Codeberg doesn't). Unknown algorithms degrade to the size check alone,
 /// matching the no-digest path — never hard-fail on a missing capability.
 fn verify_digest(tool: &str, digest: Option<&str>, actual: &[u8]) -> anyhow::Result<()> {
     let Some(digest) = digest else {
@@ -1352,7 +1356,7 @@ mod tests {
             "test",
             &url,
             &tmp.path().join("asset"),
-            body.len() as u64,
+            Some(body.len() as u64),
             Some(&digest),
         )
         .expect("matching digest must pass");
@@ -1368,7 +1372,7 @@ mod tests {
             "test",
             &url,
             &tmp.path().join("asset"),
-            body.len() as u64,
+            Some(body.len() as u64),
             Some(&digest),
         )
         .expect_err("wrong digest must fail");
@@ -1384,7 +1388,7 @@ mod tests {
             "test",
             &url,
             &tmp.path().join("asset"),
-            body.len() as u64,
+            Some(body.len() as u64),
             None,
         )
         .expect("no digest must pass");
@@ -1399,7 +1403,7 @@ mod tests {
             "test",
             &url,
             &tmp.path().join("asset"),
-            body.len() as u64,
+            Some(body.len() as u64),
             Some("md5:beef"),
         )
         .expect("unknown algorithm degrades to size-only");
@@ -1414,7 +1418,7 @@ mod tests {
             "test",
             &url,
             &tmp.path().join("asset"),
-            body.len() as u64 + 1,
+            Some(body.len() as u64 + 1),
             None,
         )
         .expect_err("size mismatch must fail");

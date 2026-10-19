@@ -1,7 +1,7 @@
 //! `rig update --self` — rig manages its own binary and bootstrap without
-//! a config entry. Version knowledge lives here (mirrored by the hardcoded
-//! archive name in the `rig.zsh` bootstrap); nothing in `~/.rig.toml`
-//! decides how rig updates itself.
+//! a config entry. Version knowledge lives here (mirrored by the target
+//! mapping in the `rig.zsh` bootstrap); nothing in `~/.rig.toml` decides
+//! how rig updates itself. It never touches the rate-limited GitHub API.
 
 use std::fs;
 use std::path::Path;
@@ -9,16 +9,26 @@ use std::process::Command;
 
 use anyhow::{Context, anyhow, bail};
 
-use crate::config::Host;
 use crate::lock::{Lock, atomic_write};
 use crate::paths::Layout;
 use crate::sources;
 use crate::update::Outcome;
-use crate::version::github::{self, Asset};
 
-/// cargo-dist ships the linux-x86_64 build as `rig-<target>.tar.gz`
-/// (unpacking to `rig-<target>/rig`), not as a bare binary anymore.
-const SELF_ARCHIVE: &str = "rig-x86_64-unknown-linux-gnu.tar.gz";
+const RELEASES_URL: &str = "https://github.com/gitduk/rig/releases";
+
+/// The cargo-dist targets a release publishes, as `rig-<target>.tar.gz`
+/// unpacking to `rig-<target>/rig`.
+const SELF_TARGET: Option<&str> = if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+    Some("x86_64-unknown-linux-gnu")
+} else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+    Some("aarch64-unknown-linux-gnu")
+} else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+    Some("x86_64-apple-darwin")
+} else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+    Some("aarch64-apple-darwin")
+} else {
+    None
+};
 
 /// rig.zsh left the release archives when rig moved to cargo-dist; fetch
 /// the canonical copy from the repo on a real self-update.
@@ -68,22 +78,49 @@ fn version_tuple(tag: &str) -> (u64, u64, u64) {
     }
 }
 
-fn pick_asset<'a>(release: &'a github::Release, name: &str) -> anyhow::Result<&'a Asset> {
-    release
-        .assets
-        .iter()
-        .find(|a| a.name == name)
-        .ok_or_else(|| {
-            let list: String = release
-                .assets
-                .iter()
-                .map(|a| format!("\n    - {}", a.name))
-                .collect();
-            anyhow!(
-                "release {} has no `{name}` asset; available:{list}",
-                release.tag
-            )
-        })
+/// `/releases/latest` redirects to `/releases/tag/<tag>` — the web
+/// route, unlike the API, has no 60 requests/hour anonymous quota.
+fn latest_tag() -> anyhow::Result<String> {
+    let url = format!("{RELEASES_URL}/latest");
+    let response = ureq::get(&url)
+        .header("User-Agent", sources::USER_AGENT)
+        .config()
+        .max_redirects(0)
+        .build()
+        .call()
+        .with_context(|| format!("failed to query {url}"))?;
+    let location = response
+        .headers()
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| anyhow!("{url} answered {} without a redirect", response.status()))?;
+    tag_from_location(location)
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("{url} redirected to `{location}`, not a release tag"))
+}
+
+fn tag_from_location(location: &str) -> Option<&str> {
+    let (_, tag) = location.rsplit_once("/releases/tag/")?;
+    (!tag.is_empty() && !tag.contains('/')).then_some(tag)
+}
+
+/// cargo-dist publishes `<asset>.sha256` as `<hex> *<asset>`.
+fn fetch_digest(url: &str) -> anyhow::Result<String> {
+    let text = ureq::get(url)
+        .header("User-Agent", sources::USER_AGENT)
+        .call()
+        .with_context(|| format!("failed to fetch {url}"))?
+        .body_mut()
+        .read_to_string()
+        .with_context(|| format!("failed to read response body from {url}"))?;
+    parse_sha256_file(&text)
+        .map(|hex| format!("sha256:{hex}"))
+        .ok_or_else(|| anyhow!("{url} holds no sha256 digest"))
+}
+
+fn parse_sha256_file(text: &str) -> Option<&str> {
+    let hex = text.split_whitespace().next()?;
+    (hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit())).then_some(hex)
 }
 
 /// Fetches the canonical `rig.zsh` from the repo's raw URL. The raw
@@ -121,28 +158,25 @@ fn fetch_bootstrap() -> anyhow::Result<String> {
 /// update — never on a no-op `--self` — so a stale fetched `rig.zsh`
 /// can't overwrite a newer local one.
 pub fn update_self(force: bool, layout: &Layout, lock: &mut Lock) -> anyhow::Result<Outcome> {
-    // The release publishes a single linux-x86_64 build; fail with a clear
-    // message instead of an exec-format error after the download.
-    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        bail!(
-            "`rig update --self` publishes only a linux-x86_64 build — upgrade rig manually on this platform"
-        );
-    }
+    // Fail with a clear message instead of a 404 on a missing archive.
+    let Some(target) = SELF_TARGET else {
+        bail!("rig publishes no release build for this platform — upgrade rig manually");
+    };
 
-    let release = github::latest_release("gitduk/rig", Host::Github)
-        .context("failed to resolve the latest rig release")?;
+    let tag = latest_tag().context("failed to resolve the latest rig release")?;
     let live = layout.prefix_bin_dir.join("rig");
     let from = installed_version(&live).unwrap_or_else(local_version);
     // An installed build newer than the latest release (e.g. cargo-installed
     // master) must never be downgraded by `--self`.
-    if !force && version_tuple(&from) >= version_tuple(&release.tag) {
+    if !force && version_tuple(&from) >= version_tuple(&tag) {
         return Ok(Outcome::UpToDate { version: from });
     }
 
-    let archive = pick_asset(&release, SELF_ARCHIVE)?;
-    // The bootstrap fetch and the archive download are the only network
-    // steps, and both finish before anything goes live — a failure leaves
-    // the current rig fully intact.
+    let archive = format!("rig-{target}.tar.gz");
+    let archive_url = format!("{RELEASES_URL}/download/{tag}/{archive}");
+    let digest = fetch_digest(&format!("{archive_url}.sha256"))?;
+    // Every network step finishes before anything goes live — a failure
+    // leaves the current rig fully intact.
     eprintln!("rig: downloading rig.zsh");
     let bootstrap = fetch_bootstrap()?;
     // Staging next to the live binary keeps the final rename on one
@@ -151,21 +185,13 @@ pub fn update_self(force: bool, layout: &Layout, lock: &mut Lock) -> anyhow::Res
     // `.d` suffix keeps this clear of the file older rigs left at
     // `.rig-self-update` after a failed download.
     let tmp_dir = layout.prefix_bin_dir.join(".rig-self-update.d");
-    eprintln!("rig: downloading {SELF_ARCHIVE}");
-    sources::download(
-        "rig",
-        &archive.url,
-        &tmp_tar,
-        archive.size,
-        archive.digest.as_deref(),
-    )
-    .with_context(|| format!("failed to download {SELF_ARCHIVE}"))?;
+    eprintln!("rig: downloading {archive}");
+    sources::download("rig", &archive_url, &tmp_tar, None, Some(&digest))
+        .with_context(|| format!("failed to download {archive}"))?;
     sources::extract(&tmp_tar, &tmp_dir, None)
-        .with_context(|| format!("failed to unpack {SELF_ARCHIVE}"))?;
+        .with_context(|| format!("failed to unpack {archive}"))?;
     // dist tarballs nest the binary one level down: `rig-<target>/rig`.
-    let tmp_bin = tmp_dir
-        .join(SELF_ARCHIVE.trim_end_matches(".tar.gz"))
-        .join("rig");
+    let tmp_bin = tmp_dir.join(format!("rig-{target}")).join("rig");
     if let Err(e) = sources::run_version_smoke(&tmp_bin, "rig") {
         fs::remove_file(&tmp_tar).ok();
         fs::remove_dir_all(&tmp_dir).ok();
@@ -182,30 +208,12 @@ pub fn update_self(force: bool, layout: &Layout, lock: &mut Lock) -> anyhow::Res
     // `[[repo]] gitduk/rig` config era is retired here.
     lock.tool.remove("rig");
 
-    Ok(Outcome::Updated {
-        from,
-        to: release.tag,
-    })
+    Ok(Outcome::Updated { from, to: tag })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn release_with(assets: &[&str]) -> github::Release {
-        github::Release {
-            tag: "v9.9.9".to_string(),
-            assets: assets
-                .iter()
-                .map(|n| Asset {
-                    name: n.to_string(),
-                    url: format!("https://example.com/{n}"),
-                    size: 1,
-                    digest: None,
-                })
-                .collect(),
-        }
-    }
 
     #[test]
     fn local_version_is_v_prefixed() {
@@ -229,21 +237,33 @@ mod tests {
     }
 
     #[test]
-    fn pick_asset_finds_the_named_asset() {
-        let release = release_with(&["rig-aarch64-unknown-linux-gnu.tar.gz", SELF_ARCHIVE]);
+    fn tag_from_location_takes_the_last_segment() {
+        let base = "https://github.com/gitduk/rig/releases";
         assert_eq!(
-            pick_asset(&release, SELF_ARCHIVE)
-                .expect("asset should be found")
-                .name,
-            SELF_ARCHIVE
+            tag_from_location(&format!("{base}/tag/v1.0.4")),
+            Some("v1.0.4")
         );
+        // No release yet: GitHub bounces to the release list.
+        assert_eq!(tag_from_location(base), None);
+        assert_eq!(tag_from_location(&format!("{base}/tag/")), None);
     }
 
     #[test]
-    fn pick_asset_lists_available_assets_on_miss() {
-        let release = release_with(&["rig-aarch64-unknown-linux-gnu.tar.gz"]);
-        let err = pick_asset(&release, SELF_ARCHIVE).unwrap_err().to_string();
-        assert!(err.contains(SELF_ARCHIVE));
-        assert!(err.contains("rig-aarch64-unknown-linux-gnu.tar.gz"));
+    #[ignore = "hits the real GitHub release page; run with `cargo test -- --ignored`"]
+    fn resolves_the_real_latest_tag() {
+        let tag = latest_tag().expect("gitduk/rig should have a latest release");
+        assert!(tag.starts_with('v'), "unexpected tag: {tag}");
+    }
+
+    #[test]
+    fn parse_sha256_file_reads_the_dist_format() {
+        let hex = "5826645c49fbbe388a0d40f0ff6eba36c5ae2cb84b707255f8b4874353cbebd8";
+        assert_eq!(
+            parse_sha256_file(&format!("{hex} *rig.tar.gz\n")),
+            Some(hex)
+        );
+        assert_eq!(parse_sha256_file(hex), Some(hex));
+        assert_eq!(parse_sha256_file("Not Found"), None);
+        assert_eq!(parse_sha256_file(""), None);
     }
 }
