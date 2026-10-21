@@ -27,11 +27,7 @@ pub fn install(
     let tool = tool_key(&entry.name);
     let version = crates_io::latest_version(&entry.name)
         .with_context(|| format!("failed to resolve latest version for {}", entry.name))?;
-    progress!(
-        "{tool}: {} {} via cargo",
-        phase.verb(),
-        phase.versions(&version)
-    );
+    progress!("{tool}: {} via cargo", phase.describe_doing(&version));
 
     let tool_dir = layout.tool_pkg_dir(tool);
     let final_dir = layout.pkg_dir(tool, &version);
@@ -48,7 +44,7 @@ pub fn install(
     run_child(&mut command, &format!("`cargo install {}`", entry.name))?;
 
     if let Some(setup) = &entry.common.setup {
-        run_setup(setup, &partial_dir, phase, &entry.common.env)
+        run_setup(tool, setup, &partial_dir, phase, &entry.common.env)
             .with_context(|| format!("setup hook failed for {tool}"))?;
     }
 
@@ -67,7 +63,7 @@ pub fn install(
     // Only after finalize: the eval command may resolve through the symlink
     // collect_bins just created, which points at final_dir, not partial_dir.
     let (eval_cacheable, eval_cached_output, eval_evidence) =
-        super::resolve_eval_cache(entry.common.eval.as_ref());
+        super::resolve_eval_cache(tool, entry.common.eval.as_ref());
 
     Ok(ToolLock {
         version,

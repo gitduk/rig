@@ -79,7 +79,7 @@ pub fn install(
     git_clone(&url, &partial_dir, &entry.common.env)?;
 
     if let Some(setup) = &entry.common.setup {
-        run_setup(setup, &partial_dir, phase, &entry.common.env)
+        run_setup(tool, setup, &partial_dir, phase, &entry.common.env)
             .with_context(|| format!("setup hook failed for {tool}"))?;
     }
 
@@ -101,7 +101,7 @@ pub fn install(
     // Only after finalize: the eval command may resolve through the symlink
     // collect_bins just created, which points at final_dir, not partial_dir.
     let (eval_cacheable, eval_cached_output, eval_evidence) =
-        super::resolve_eval_cache(entry.common.eval.as_ref());
+        super::resolve_eval_cache(tool, entry.common.eval.as_ref());
 
     Ok(ToolLock {
         version: commit,

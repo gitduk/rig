@@ -9,6 +9,14 @@
   notice there and their details at the end. The summary no longer repeats
   those lines, and the "not installed by rig (skipped)" list is gone (its
   count stays in the tally).
+- Output polish: `--force` on a current version reports `reinstalled 1.2`
+  instead of `updated 1.2 -> 1.2` (results, progress and tally alike);
+  `install` and `update` result lines (failure notices included) share
+  alignment and highlighting; `rig list` aligns descriptions;
+  every tool-scoped warning names its tool; the "let rig take over?" prompt
+  goes to stderr with its tool name and is no longer appended to or erased
+  by the parallel counter; `rig update --self` no longer echoes the new
+  build's `--version` output.
 
 ## 1.1.0 - 2026-10-21
 

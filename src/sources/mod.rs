@@ -92,11 +92,12 @@ pub fn resolve_declared_bins(
 ) -> anyhow::Result<Vec<String>> {
     BinSpec::declared_names(bin, tool)
         .iter()
-        .map(|name| resolve_bin_name(name, preferred_dir, context))
+        .map(|name| resolve_bin_name(tool, name, preferred_dir, context))
         .collect()
 }
 
 fn resolve_bin_name(
+    tool: &str,
     name: &str,
     preferred_dir: Option<&Path>,
     context: &str,
@@ -107,7 +108,7 @@ fn resolve_bin_name(
             return Ok(managed.display().to_string());
         }
         warning!(
-            "warning: {name} landed outside {} after {context} — \
+            "{tool}: warning: {name} landed outside {} after {context} — \
              recording its ambient PATH location instead",
             dir.display()
         );
@@ -607,9 +608,11 @@ pub fn smoke_test_version(
 /// can't even print its version must never go live. Used by the repo flow
 /// and `rig update --self`.
 pub fn run_version_smoke(bin: &Path, label: &str) -> anyhow::Result<()> {
-    run_child(
+    // Always captured: the version text only matters when the check fails.
+    run_child_in(
         Command::new(bin).arg("--version"),
         &format!("`{label} --version`"),
+        false,
     )
     .with_context(|| format!("`{label} --version` check failed — refusing to make this build live"))
 }
@@ -673,22 +676,16 @@ static CONFIRM_GUARD: Mutex<()> = Mutex::new(());
 
 /// Prompts before deleting `target`. Refuses when stdin isn't a TTY so
 /// scripts/CI never hang; callers keep the old error path on refusal.
-fn confirm_overwrite(target: &Path) -> anyhow::Result<bool> {
+fn confirm_overwrite(tool: &str, target: &Path) -> anyhow::Result<bool> {
     let _guard = CONFIRM_GUARD.lock().expect("confirm guard poisoned");
     if !std::io::stdin().is_terminal() {
         return Ok(false);
     }
-    print!(
-        "{} exists and isn't tracked by rig — delete it and let rig take over? [y/N] ",
+    let line = crate::output::prompt(&format!(
+        "{tool}: {} exists and isn't tracked by rig — delete it and let rig take over? [y/N] ",
         target.display()
-    );
-    std::io::stdout()
-        .flush()
-        .context("failed to flush overwrite prompt")?;
-    let mut line = String::new();
-    std::io::stdin()
-        .read_line(&mut line)
-        .context("failed to read confirmation")?;
+    ))
+    .context("failed to read confirmation")?;
     Ok(answer_is_yes(&line))
 }
 
@@ -728,7 +725,7 @@ fn check_conflict(target: &Path, tool: &str, lock: &Lock) -> anyhow::Result<()> 
             target.display()
         );
     }
-    if confirm_overwrite(target)? {
+    if confirm_overwrite(tool, target)? {
         return Ok(());
     }
     bail!(
@@ -759,6 +756,7 @@ fn symlink_replacing(source: &Path, target: &Path) -> anyhow::Result<()> {
 /// Resolves `completions` in `search_dir`, symlinking into
 /// `completions_dir` against `link_root` — same rationale as `collect_bins`.
 pub fn collect_completions(
+    tool: &str,
     search_dir: &Path,
     generate_cwd: &Path,
     link_root: &Path,
@@ -781,7 +779,7 @@ pub fn collect_completions(
             link_completions(std::slice::from_ref(&source), completions_dir)
         }
         CompletionsSpec::Generate { generate } => {
-            run_shell(generate, generate_cwd, env)?;
+            run_shell(tool, generate, generate_cwd, env)?;
             let files = walk_files(search_dir)?;
             let sources: Vec<PathBuf> = underscore_files(&files)
                 .into_iter()
@@ -840,30 +838,55 @@ impl Phase<'_> {
         }
     }
 
-    /// Version for progress lines: `to` on install, `from -> to` on update.
-    pub fn versions(self, to: &str) -> String {
+    /// `to` on install or a same-version reinstall, `from -> to` otherwise.
+    fn versions(self, to: &str) -> String {
         match self {
-            Phase::Install => display_version(to).to_string(),
-            Phase::Update { from } => {
+            Phase::Update { from } if from != to => {
                 format!("{} -> {}", display_version(from), display_version(to))
             }
+            _ => display_version(to).to_string(),
         }
+    }
+
+    /// (in progress, done) — `--force` on a current version reinstalls.
+    fn verbs(self, to: &str) -> (&'static str, &'static str) {
+        match self {
+            Phase::Install => ("installing", "installed"),
+            Phase::Update { from } if from == to => ("reinstalling", "reinstalled"),
+            Phase::Update { .. } => ("updating", "updated"),
+        }
+    }
+
+    /// The bare result word: `installed`, `updated` or `reinstalled`.
+    pub fn done_verb(self, to: &str) -> &'static str {
+        self.verbs(to).1
+    }
+
+    /// Progress text, e.g. `updating 1.0 -> 1.1` or `reinstalling 1.1`.
+    pub fn describe_doing(self, to: &str) -> String {
+        format!("{} {}", self.verbs(to).0, self.versions(to))
+    }
+
+    /// Result text, e.g. `updated 1.0 -> 1.1` or `reinstalled 1.1`.
+    pub fn describe_done(self, to: &str) -> String {
+        format!("{} {}", self.done_verb(to), self.versions(to))
     }
 }
 
 /// `setup`: one field covering both install and update — see the `Split`
 /// variant for the rare case that genuinely needs to differ.
 pub fn run_setup(
+    tool: &str,
     spec: &SetupSpec,
     cwd: &Path,
     phase: Phase,
     env: &BTreeMap<String, String>,
 ) -> anyhow::Result<()> {
     match spec {
-        SetupSpec::Single(cmd) => run_shell(cmd, cwd, env),
+        SetupSpec::Single(cmd) => run_shell(tool, cmd, cwd, env),
         SetupSpec::Multiple(cmds) => {
             for cmd in cmds {
-                run_shell(cmd, cwd, env)?;
+                run_shell(tool, cmd, cwd, env)?;
             }
             Ok(())
         }
@@ -872,7 +895,7 @@ pub fn run_setup(
                 Phase::Install => install,
                 Phase::Update { .. } => update,
             };
-            run_shell(cmd, cwd, env)
+            run_shell(tool, cmd, cwd, env)
         }
     }
 }
@@ -892,10 +915,15 @@ fn mentions_sudo(cmd: &str) -> bool {
 
 /// Hooks that reach outside rig's control (via `sudo`) are allowed, but
 /// must not be silent about it.
-fn run_shell(cmd: &str, cwd: &Path, env: &BTreeMap<String, String>) -> anyhow::Result<()> {
+fn run_shell(
+    tool: &str,
+    cmd: &str,
+    cwd: &Path,
+    env: &BTreeMap<String, String>,
+) -> anyhow::Result<()> {
     if mentions_sudo(cmd) {
         warning!(
-            "warning: setup hook runs `sudo` — writes outside rig's control, \
+            "{tool}: warning: setup hook runs `sudo` — writes outside rig's control, \
              uninstall will be incomplete: {cmd}"
         );
     }
@@ -955,7 +983,10 @@ fn run_child_in(command: &mut Command, what: &str, streaming: bool) -> anyhow::R
 
 /// Resolves `eval` to (cacheable?, output to embed, probe evidence).
 /// Probe/capture failures degrade to "not cacheable" — never fail the install.
-pub fn resolve_eval_cache(eval: Option<&EvalSpec>) -> (Option<bool>, Option<String>, Vec<String>) {
+pub fn resolve_eval_cache(
+    tool: &str,
+    eval: Option<&EvalSpec>,
+) -> (Option<bool>, Option<String>, Vec<String>) {
     let Some(eval) = eval else {
         return (None, None, Vec::new());
     };
@@ -965,7 +996,10 @@ pub fn resolve_eval_cache(eval: Option<&EvalSpec>) -> (Option<bool>, Option<Stri
         Some(true) => {
             let output = crate::evalcache::capture(eval.command())
                 .inspect_err(|e| {
-                    warning!("warning: eval capture failed for `{}`: {e}", eval.command())
+                    warning!(
+                        "{tool}: warning: eval capture failed for `{}`: {e}",
+                        eval.command()
+                    )
                 })
                 .ok();
             return (Some(true), output, Vec::new());
@@ -980,7 +1014,7 @@ pub fn resolve_eval_cache(eval: Option<&EvalSpec>) -> (Option<bool>, Option<Stri
         }
         Err(e) => {
             warning!(
-                "warning: eval cacheability probe failed for `{}`, falling back to live eval: {e}",
+                "{tool}: warning: eval cacheability probe failed for `{}`, falling back to live eval: {e}",
                 eval.command()
             );
             (None, None, Vec::new())
@@ -1024,6 +1058,7 @@ pub fn collect_artifacts(
         .and_then(|(_, source)| source.parent().map(Path::to_path_buf))
         .unwrap_or_else(|| search_dir.to_path_buf());
     let completions = collect_completions(
+        tool,
         search_dir,
         &generate_cwd,
         link_root,
@@ -1091,7 +1126,7 @@ mod tests {
         fs::create_dir_all(&preferred_dir).expect("mkdir preferred_dir");
         fs::write(preferred_dir.join("witr"), b"binary").expect("write fake binary");
 
-        let resolved = resolve_bin_name("witr", Some(&preferred_dir), "test")
+        let resolved = resolve_bin_name("test", "witr", Some(&preferred_dir), "test")
             .expect("preferred-dir bin should resolve without touching PATH");
 
         assert_eq!(resolved, preferred_dir.join("witr").display().to_string());
@@ -1104,7 +1139,7 @@ mod tests {
         // Never created — nothing landed there, e.g. a script with its own
         // install-location convention (`zb`'s `ZEROBREW_PREFIX`).
 
-        let resolved = resolve_bin_name("sh", Some(&preferred_dir), "test")
+        let resolved = resolve_bin_name("test", "sh", Some(&preferred_dir), "test")
             .expect("`sh` should resolve via ambient PATH");
 
         assert!(resolved.ends_with("/sh"));
@@ -1117,6 +1152,16 @@ mod tests {
             .collect();
         names.sort();
         names
+    }
+
+    #[test]
+    fn phase_text_says_reinstalled_when_the_version_did_not_change() {
+        let update = Phase::Update { from: "1.0" };
+        assert_eq!(update.describe_doing("1.1"), "updating 1.0 -> 1.1");
+        assert_eq!(update.describe_done("1.1"), "updated 1.0 -> 1.1");
+        assert_eq!(update.describe_doing("1.0"), "reinstalling 1.0");
+        assert_eq!(update.describe_done("1.0"), "reinstalled 1.0");
+        assert_eq!(Phase::Install.describe_done("1.1"), "installed 1.1");
     }
 
     #[test]
@@ -1663,7 +1708,7 @@ mod tests {
     #[test]
     fn run_shell_stops_at_the_first_failing_command() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let err = run_shell("false; touch reached", tmp.path(), &BTreeMap::new())
+        let err = run_shell("test", "false; touch reached", tmp.path(), &BTreeMap::new())
             .expect_err("`false` must fail the hook");
         assert!(err.to_string().contains("setup command"), "{err}");
         assert!(!tmp.path().join("reached").exists());

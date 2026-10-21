@@ -61,7 +61,7 @@ pub fn install(entry: &CurlEntry, layout: &Layout, phase: Phase) -> anyhow::Resu
     run_child(&mut command, &format!("install script for {tool}"))?;
 
     if let Some(setup) = &entry.common.setup {
-        run_setup(setup, &work_dir, phase, &entry.common.env)
+        run_setup(tool, setup, &work_dir, phase, &entry.common.env)
             .with_context(|| format!("setup hook failed for {tool}"))?;
     }
 
@@ -72,6 +72,7 @@ pub fn install(entry: &CurlEntry, layout: &Layout, phase: Phase) -> anyhow::Resu
         &format!("running {tool}'s install script"),
     )?;
     let completions = collect_completions(
+        tool,
         &work_dir,
         &work_dir,
         &work_dir,
@@ -81,7 +82,7 @@ pub fn install(entry: &CurlEntry, layout: &Layout, phase: Phase) -> anyhow::Resu
     )?;
 
     let (eval_cacheable, eval_cached_output, eval_evidence) =
-        super::resolve_eval_cache(entry.common.eval.as_ref());
+        super::resolve_eval_cache(tool, entry.common.eval.as_ref());
 
     Ok(ToolLock {
         version: crate::version::UNVERSIONED.to_string(),

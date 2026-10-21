@@ -277,6 +277,8 @@ fn cmd_install(tools: Vec<String>, verbose: bool) -> anyhow::Result<ExitCode> {
         }
     }
 
+    let width = label_width(serial.iter().chain(&parallel));
+
     // Workers only read shared state, so the conflict check runs against a
     // snapshot taken at batch start. The merge below keeps the first-recorded
     // lock entry — same outcome as the serial path, where the second install
@@ -301,13 +303,14 @@ fn cmd_install(tools: Vec<String>, verbose: bool) -> anyhow::Result<ExitCode> {
             Ok((key, outcome)) => {
                 output::clear_line();
                 let message = describe_install_outcome(&outcome);
+                let changed = !matches!(outcome, InstallOutcome::AlreadyCurrent { .. });
                 let new_lock = match outcome {
                     InstallOutcome::AlreadyCurrent { .. } => None,
                     InstallOutcome::Installed(new) => Some(new),
                     InstallOutcome::Updated { lock: new, .. } => Some(new),
                 };
                 match new_lock {
-                    None => println!("{key}: {message}"),
+                    None => print_result_line(&key, &message, changed, width),
                     Some(entry) => {
                         lock.tool.insert(key.clone(), entry);
                         if let Err(e) = lock::save_and_sync(&config, &lock, &layout) {
@@ -315,7 +318,7 @@ fn cmd_install(tools: Vec<String>, verbose: bool) -> anyhow::Result<ExitCode> {
                             print_error(Some(&name), &e);
                         } else {
                             sources::prune_superseded(&key, &lock.tool[&key], &layout);
-                            println!("{key}: {message}");
+                            print_result_line(&key, &message, changed, width);
                         }
                     }
                 }
@@ -349,11 +352,9 @@ fn describe_install_outcome(outcome: &InstallOutcome) -> String {
         InstallOutcome::Installed(lock) => {
             format!("installed {}", display_version(&lock.version))
         }
-        InstallOutcome::Updated { from, lock } => format!(
-            "updated {} -> {}",
-            display_version(from),
-            display_version(&lock.version)
-        ),
+        InstallOutcome::Updated { from, lock } => {
+            sources::Phase::Update { from }.describe_done(&lock.version)
+        }
         InstallOutcome::AlreadyCurrent { version } => {
             format!("up to date ({})", display_version(version))
         }
@@ -419,7 +420,8 @@ fn install_one(
 /// (`cmd_sync`'s plugin backfill) — same semantics as `install_one` + merge.
 fn install_entry(ctx: &mut Ctx, requested: &str) -> anyhow::Result<()> {
     let (key, outcome) = install_one(&ctx.config, &ctx.lock, &ctx.layout, requested)?;
-    println!("{key}: {}", describe_install_outcome(&outcome));
+    let changed = !matches!(outcome, InstallOutcome::AlreadyCurrent { .. });
+    print_result_line(&key, &describe_install_outcome(&outcome), changed, 0);
     match outcome {
         InstallOutcome::Installed(tool_lock)
         | InstallOutcome::Updated {
@@ -461,6 +463,13 @@ fn cmd_update(tools: Vec<String>, force: bool, verbose: bool) -> anyhow::Result<
     let filter = (!tools.is_empty()).then_some(tools.as_slice());
     // Named tools always get an answer; a blanket run folds "up to date".
     let fold = filter.is_none();
+    let width =
+        match filter {
+            Some(names) => label_width(names.iter().map(|n| {
+                config::resolve_tool(&ctx.config, n).map_or_else(|| n.clone(), |e| e.key())
+            })),
+            None => label_width(ctx.lock.tool.keys()),
+        };
     let started = Instant::now();
     let mut live = HashSet::new();
     let reports = update::update_all(
@@ -472,17 +481,19 @@ fn cmd_update(tools: Vec<String>, force: bool, verbose: bool) -> anyhow::Result<
         filter,
         verbose,
         |report| {
-            if print_live_report(report, fold) {
+            if print_live_report(report, fold, width) {
                 live.insert(report.tool.clone());
             }
         },
     );
 
-    Ok(if print_reports(&reports, fold, &live, started.elapsed()) {
-        ExitCode::FAILURE
-    } else {
-        ExitCode::SUCCESS
-    })
+    Ok(
+        if print_reports(&reports, fold, &live, width, started.elapsed()) {
+            ExitCode::FAILURE
+        } else {
+            ExitCode::SUCCESS
+        },
+    )
 }
 
 /// Whether an ok outcome earns its own line rather than just a tally count.
@@ -494,31 +505,41 @@ fn shows_line(outcome: &update::Outcome, fold_up_to_date: bool) -> bool {
     }
 }
 
-fn print_outcome_line(tool: &str, outcome: &update::Outcome, width: usize) {
-    let (green, reset) = if color_enabled(&std::io::stdout()) {
+/// Column width that aligns every `tool:` label of one run.
+fn label_width(keys: impl IntoIterator<Item = impl AsRef<str>>) -> usize {
+    keys.into_iter()
+        .map(|k| k.as_ref().len() + 1)
+        .max()
+        .unwrap_or(0)
+}
+
+/// One `tool: result` line, shared by install and update; `changed`
+/// (something was actually installed) is highlighted.
+fn print_result_line(tool: &str, text: &str, changed: bool, width: usize) {
+    let (green, reset) = if changed && color_enabled(&std::io::stdout()) {
         ("\x1b[32m", "\x1b[0m")
     } else {
         ("", "")
     };
     let label = format!("{tool}:");
-    let text = describe_outcome(outcome);
-    if matches!(outcome, update::Outcome::Updated { .. }) {
-        println!("{label:<width$} {green}{text}{reset}");
-    } else {
-        println!("{label:<width$} {text}");
-    }
+    println!("{label:<width$} {green}{text}{reset}");
+}
+
+fn print_outcome_line(tool: &str, outcome: &update::Outcome, width: usize) {
+    let changed = matches!(outcome, update::Outcome::Updated { .. });
+    print_result_line(tool, &describe_outcome(outcome), changed, width);
 }
 
 /// Batch mode shows only a counter while tools run; this prints each result
 /// above it as it lands, like `rig install`. Returns whether a line printed.
-fn print_live_report(report: &update::Report, fold_up_to_date: bool) -> bool {
+fn print_live_report(report: &update::Report, fold_up_to_date: bool, width: usize) -> bool {
     if output::streaming() {
         return false;
     }
     match &report.outcome {
         Ok(outcome) if shows_line(outcome, fold_up_to_date) => {
             output::clear_line();
-            print_outcome_line(&report.tool, outcome, 0);
+            print_outcome_line(&report.tool, outcome, width);
             true
         }
         Ok(_) => false,
@@ -529,7 +550,8 @@ fn print_live_report(report: &update::Report, fold_up_to_date: bool) -> bool {
                 ("", "")
             };
             output::clear_line();
-            eprintln!("{red}{}:{reset} failed, details below", report.tool);
+            let label = format!("{}:", report.tool);
+            eprintln!("{red}{label:<width$}{reset} failed, details below");
             false
         }
     }
@@ -542,6 +564,7 @@ fn print_reports(
     reports: &[update::Report],
     fold_up_to_date: bool,
     live: &HashSet<String>,
+    width: usize,
     elapsed: Duration,
 ) -> bool {
     // `update_all` returns completion order, i.e. network-latency order —
@@ -564,7 +587,6 @@ fn print_reports(
     } else {
         ("", "")
     };
-    let width = shown.iter().map(|(t, _)| t.len() + 1).max().unwrap_or(0);
     for (tool, outcome) in &shown {
         print_outcome_line(tool, outcome, width);
     }
@@ -575,17 +597,31 @@ fn print_reports(
     }
 
     if reports.len() > 1 {
-        // The rank fixes tally order; the label is what gets printed.
-        let kind = |r: &update::Report| match &r.outcome {
-            Ok(update::Outcome::Updated { .. }) => (0, "updated"),
-            Ok(update::Outcome::Reran) => (1, "rerun"),
-            Ok(update::Outcome::EvalRefreshed { .. }) => (2, "eval refreshed"),
-            Ok(update::Outcome::NoEval) => (3, "no eval"),
-            Ok(update::Outcome::UpToDate { .. }) => (4, "up to date"),
-            Ok(update::Outcome::NotInstalled) => (5, "not installed"),
-            Err(_) => (6, "failed"),
+        const ORDER: &[&str] = &[
+            "updated",
+            "reinstalled",
+            "rerun",
+            "eval refreshed",
+            "no eval",
+            "up to date",
+            "not installed",
+            "failed",
+        ];
+        let kind = |r: &update::Report| {
+            let label = match &r.outcome {
+                Ok(update::Outcome::Updated { from, to }) => {
+                    sources::Phase::Update { from }.done_verb(to)
+                }
+                Ok(update::Outcome::Reran) => "rerun",
+                Ok(update::Outcome::EvalRefreshed { .. }) => "eval refreshed",
+                Ok(update::Outcome::NoEval) => "no eval",
+                Ok(update::Outcome::UpToDate { .. }) => "up to date",
+                Ok(update::Outcome::NotInstalled) => "not installed",
+                Err(_) => "failed",
+            };
+            (ORDER.iter().position(|l| *l == label), label)
         };
-        let mut tally: BTreeMap<(u8, &str), usize> = BTreeMap::new();
+        let mut tally: BTreeMap<(Option<usize>, &str), usize> = BTreeMap::new();
         for report in &reports {
             *tally.entry(kind(report)).or_default() += 1;
         }
@@ -607,11 +643,7 @@ fn describe_outcome(outcome: &update::Outcome) -> String {
         update::Outcome::UpToDate { version } => {
             format!("up to date ({})", display_version(version))
         }
-        update::Outcome::Updated { from, to } => format!(
-            "updated {} -> {}",
-            display_version(from),
-            display_version(to)
-        ),
+        update::Outcome::Updated { from, to } => sources::Phase::Update { from }.describe_done(to),
         update::Outcome::Reran => "rerun".to_string(),
         update::Outcome::EvalRefreshed { cacheable } => {
             let label = match cacheable {
@@ -669,6 +701,7 @@ fn remove_one(ctx: &mut Ctx, requested: &str) -> anyhow::Result<()> {
 fn cmd_list() -> anyhow::Result<()> {
     let ctx = Ctx::load()?;
     let entries = config::all_entries(&ctx.config);
+    let mut rows = Vec::new();
     for entry in &entries {
         let key = entry.key();
         let common = entry.common();
@@ -691,8 +724,12 @@ fn cmd_list() -> anyhow::Result<()> {
             [] => key,
             _ => format!("{key} | {}", statuses.join(", ")),
         };
-        match entry.description() {
-            Some(desc) => println!("{marker} {label} - {desc}"),
+        rows.push((marker, label, entry.description()));
+    }
+    let width = label_width(rows.iter().map(|(_, label, _)| label));
+    for (marker, label, desc) in rows {
+        match desc {
+            Some(desc) => println!("{marker} {label:<width$} {desc}"),
             None => println!("{marker} {label}"),
         }
     }
@@ -713,6 +750,7 @@ fn cmd_sync(force: bool) -> anyhow::Result<ExitCode> {
     if force {
         let started = Instant::now();
         let mut live = HashSet::new();
+        let width = label_width(ctx.lock.tool.keys());
         let reports = update::update_all(
             &ctx.config,
             &mut ctx.lock,
@@ -722,12 +760,12 @@ fn cmd_sync(force: bool) -> anyhow::Result<ExitCode> {
             None,
             false,
             |report| {
-                if print_live_report(report, false) {
+                if print_live_report(report, false, width) {
                     live.insert(report.tool.clone());
                 }
             },
         );
-        failed |= print_reports(&reports, false, &live, started.elapsed());
+        failed |= print_reports(&reports, false, &live, width, started.elapsed());
     }
 
     let old_keys = fs::read_to_string(&ctx.layout.init_zsh_path)

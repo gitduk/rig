@@ -51,7 +51,7 @@ pub fn install(entry: &AptEntry, layout: &Layout, phase: Phase) -> anyhow::Resul
         .with_context(|| format!("failed to create {}", scratch.display()))?;
 
     if let Some(setup) = &entry.common.setup {
-        run_setup(setup, &scratch, phase, &entry.common.env)
+        run_setup(tool, setup, &scratch, phase, &entry.common.env)
             .with_context(|| format!("setup hook failed for {tool}"))?;
     }
 
@@ -62,6 +62,7 @@ pub fn install(entry: &AptEntry, layout: &Layout, phase: Phase) -> anyhow::Resul
         &format!("installing {}", entry.name),
     )?;
     let completions = collect_completions(
+        tool,
         &scratch,
         &scratch,
         &scratch,
@@ -71,7 +72,7 @@ pub fn install(entry: &AptEntry, layout: &Layout, phase: Phase) -> anyhow::Resul
     )?;
 
     let (eval_cacheable, eval_cached_output, eval_evidence) =
-        super::resolve_eval_cache(entry.common.eval.as_ref());
+        super::resolve_eval_cache(tool, entry.common.eval.as_ref());
 
     Ok(ToolLock {
         version,

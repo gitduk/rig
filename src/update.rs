@@ -265,7 +265,7 @@ fn refresh_eval_cache(
     };
 
     let (eval_cacheable, eval_cached_output, eval_evidence) =
-        sources::resolve_eval_cache(Some(eval));
+        sources::resolve_eval_cache(key, Some(eval));
     Ok((
         Outcome::EvalRefreshed {
             cacheable: eval_cacheable,

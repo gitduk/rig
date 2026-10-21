@@ -77,10 +77,9 @@ pub fn install_with_manager(
     let bin_names = declared_bin_names(entry, &info);
 
     crate::output::progress!(
-        "{}: {} {} via {} ({})",
+        "{}: {} via {} ({})",
         tool_key(&entry.name),
-        phase.verb(),
-        phase.versions(&info.version),
+        phase.describe_doing(&info.version),
         manager.binary_name(),
         entry.name
     );
@@ -96,8 +95,14 @@ pub fn install_with_manager(
         .with_context(|| format!("failed to create {}", scratch.display()))?;
 
     if let Some(setup) = &entry.common.setup {
-        super::run_setup(setup, &scratch, phase, &entry.common.env)
-            .with_context(|| format!("setup hook failed for {}", entry.name))?;
+        super::run_setup(
+            tool_key(&entry.name),
+            setup,
+            &scratch,
+            phase,
+            &entry.common.env,
+        )
+        .with_context(|| format!("setup hook failed for {}", entry.name))?;
     }
 
     let mut bins = Vec::new();
@@ -114,6 +119,7 @@ pub fn install_with_manager(
         bins.push(path.display().to_string());
     }
     let completions = super::collect_completions(
+        tool_key(&entry.name),
         &scratch,
         &scratch,
         &scratch,
@@ -123,7 +129,7 @@ pub fn install_with_manager(
     )?;
 
     let (eval_cacheable, eval_cached_output, eval_evidence) =
-        super::resolve_eval_cache(entry.common.eval.as_ref());
+        super::resolve_eval_cache(tool_key(&entry.name), entry.common.eval.as_ref());
 
     Ok(ToolLock {
         version: info.version,
