@@ -25,6 +25,12 @@
 
 ### Changed
 
+- Installs and updates clean up after themselves. Once the new version is
+  recorded in `rig.lock`, every other entry in that tool's `pkg/<tool>/`
+  dir (superseded versions, interrupted `.partial`s) is deleted, and the
+  downloaded archive is removed from `cache/` right after unpacking. Rolling
+  back now means re-downloading. Existing piles shrink on each tool's next
+  update; `cache/` leftovers from older rigs can be deleted by hand.
 - `rig install` / `rig update` output for parallel runs on a terminal: one
   live progress line instead of interleaved step logs; child process output
   (builds, `git`, install scripts, setup hooks) is captured and shown, last

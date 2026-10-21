@@ -81,8 +81,10 @@ pub fn install(
     let tool_dir = layout.tool_pkg_dir(tool);
     let final_dir = layout.pkg_dir(tool, &release.tag);
     let partial_dir = tool_dir.join(format!("{}.partial", release.tag));
-    extract(&cache_path, &partial_dir, entry.extract)
-        .with_context(|| format!("failed to extract {}", asset.name))?;
+    let extracted = extract(&cache_path, &partial_dir, entry.extract);
+    // `download` never reuses a cached archive, so it's dead weight now.
+    fs::remove_file(&cache_path).ok();
+    extracted.with_context(|| format!("failed to extract {}", asset.name))?;
 
     if let Some(setup) = &entry.common.setup {
         run_setup(setup, &partial_dir, phase, &entry.common.env)

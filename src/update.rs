@@ -171,10 +171,15 @@ pub fn update_all(
                     // at batch end — a killed process must not lose
                     // already-updated tools.
                     match lock::save_and_sync(config, lock, layout) {
-                        Ok(()) => Report {
-                            tool,
-                            outcome: Ok(outcome),
-                        },
+                        Ok(()) => {
+                            if let Some(saved) = lock.tool.get(&tool) {
+                                sources::prune_superseded(&tool, saved, layout);
+                            }
+                            Report {
+                                tool,
+                                outcome: Ok(outcome),
+                            }
+                        }
                         Err(e) => Report {
                             tool,
                             outcome: Err(e),

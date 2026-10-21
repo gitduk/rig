@@ -314,6 +314,7 @@ fn cmd_install(tools: Vec<String>, verbose: bool) -> anyhow::Result<ExitCode> {
                             failed = true;
                             print_error(Some(&name), &e);
                         } else {
+                            sources::prune_superseded(&key, &lock.tool[&key], &layout);
                             println!("{key}: {message}");
                         }
                     }

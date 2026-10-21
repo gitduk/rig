@@ -22,9 +22,9 @@ use anyhow::{Context, bail};
 use sha2::{Digest, Sha256};
 
 use crate::config::{BinSpec, BpickSpec, Common, CompletionsSpec, EvalSpec, SetupSpec};
-use crate::lock::Lock;
+use crate::lock::{Lock, ToolLock};
 use crate::output::warning;
-use crate::paths::{self, CONFIG_PATH_HINT};
+use crate::paths::{self, CONFIG_PATH_HINT, Layout};
 use crate::version::display_version;
 use crate::version::github::Asset;
 
@@ -311,6 +311,45 @@ pub fn finalize_partial(partial_dir: &Path, final_dir: &Path) -> anyhow::Result<
             final_dir.display()
         )
     })
+}
+
+/// Deletes everything beside `tool.pkg` in its `pkg/<tool>/` dir: superseded
+/// versions and abandoned `.partial`s. Call only after the lock is saved.
+pub fn prune_superseded(key: &str, tool: &ToolLock, layout: &Layout) {
+    let Some(pkg) = tool.pkg.as_deref().map(Path::new) else {
+        return;
+    };
+    let Some(tool_dir) = pkg.parent() else {
+        return;
+    };
+    // Whatever the lock claims, never prune outside rig's own pkg tree.
+    if tool_dir.parent() != Some(layout.state_dir.join("pkg").as_path()) {
+        return;
+    }
+    if let Err(e) = remove_all_but(tool_dir, pkg) {
+        warning!("{key}: warning: failed to remove old versions: {e:#}");
+    }
+}
+
+fn remove_all_but(dir: &Path, keep: &Path) -> anyhow::Result<()> {
+    for entry in fs::read_dir(dir).with_context(|| format!("failed to read {}", dir.display()))? {
+        let entry = entry.with_context(|| format!("failed to read entry in {}", dir.display()))?;
+        let path = entry.path();
+        if path == keep {
+            continue;
+        }
+        let is_dir = entry
+            .file_type()
+            .with_context(|| format!("failed to stat {}", path.display()))?
+            .is_dir();
+        let removed = if is_dir {
+            fs::remove_dir_all(&path)
+        } else {
+            fs::remove_file(&path)
+        };
+        removed.with_context(|| format!("failed to remove {}", path.display()))?;
+    }
+    Ok(())
 }
 
 /// Removes `dir` and everything in it if present; a missing `dir` is fine.
@@ -1078,6 +1117,43 @@ mod tests {
             .collect();
         names.sort();
         names
+    }
+
+    #[test]
+    fn prune_superseded_keeps_only_the_locked_version() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let layout = Layout::new(tmp.path(), "~/.local");
+        let tool_dir = layout.tool_pkg_dir("delta");
+        for dir in ["0.18.1", "0.18.2", "0.19.0.partial"] {
+            fs::create_dir_all(tool_dir.join(dir).join("sub")).expect("mkdir version");
+        }
+        fs::write(tool_dir.join("stray"), b"").expect("write stray file");
+        let tool = ToolLock {
+            pkg: Some(tool_dir.join("0.18.2").display().to_string()),
+            ..crate::lock::test_tool_lock()
+        };
+
+        prune_superseded("delta", &tool, &layout);
+
+        assert_eq!(names_in(&tool_dir), ["0.18.2"]);
+        assert!(tool_dir.join("0.18.2/sub").is_dir());
+    }
+
+    #[test]
+    fn prune_superseded_never_touches_a_pkg_outside_the_pkg_tree() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let layout = Layout::new(&tmp.path().join("home"), "~/.local");
+        let elsewhere = tmp.path().join("elsewhere");
+        fs::create_dir_all(elsewhere.join("keep")).expect("mkdir");
+        fs::create_dir_all(elsewhere.join("sibling")).expect("mkdir");
+        let tool = ToolLock {
+            pkg: Some(elsewhere.join("keep").display().to_string()),
+            ..crate::lock::test_tool_lock()
+        };
+
+        prune_superseded("delta", &tool, &layout);
+
+        assert_eq!(names_in(&elsewhere), ["keep", "sibling"]);
     }
 
     #[test]
