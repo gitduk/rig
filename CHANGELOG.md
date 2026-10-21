@@ -25,6 +25,11 @@
 
 ### Changed
 
+- Parallel `rig update` on a terminal prints each tool's result above the
+  live counter as it lands, like `rig install`; failures get a one-line
+  notice there and their details at the end. The summary no longer repeats
+  those lines, and the "not installed by rig (skipped)" list is gone (its
+  count stays in the tally).
 - Installs and updates clean up after themselves. Once the new version is
   recorded in `rig.lock`, every other entry in that tool's `pkg/<tool>/`
   dir (superseded versions, interrupted `.partial`s) is deleted, and the

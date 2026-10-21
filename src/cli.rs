@@ -459,7 +459,10 @@ fn cmd_update(tools: Vec<String>, force: bool, verbose: bool) -> anyhow::Result<
     let _state_lock = acquire_state_lock()?;
     let mut ctx = Ctx::load()?;
     let filter = (!tools.is_empty()).then_some(tools.as_slice());
+    // Named tools always get an answer; a blanket run folds "up to date".
+    let fold = filter.is_none();
     let started = Instant::now();
+    let mut live = HashSet::new();
     let reports = update::update_all(
         &ctx.config,
         &mut ctx.lock,
@@ -468,22 +471,79 @@ fn cmd_update(tools: Vec<String>, force: bool, verbose: bool) -> anyhow::Result<
         false,
         filter,
         verbose,
+        |report| {
+            if print_live_report(report, fold) {
+                live.insert(report.tool.clone());
+            }
+        },
     );
 
-    // Named tools always get an answer; a blanket run folds "up to date".
-    Ok(
-        if print_reports(&reports, filter.is_none(), started.elapsed()) {
-            ExitCode::FAILURE
-        } else {
-            ExitCode::SUCCESS
-        },
-    )
+    Ok(if print_reports(&reports, fold, &live, started.elapsed()) {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+/// Whether an ok outcome earns its own line rather than just a tally count.
+fn shows_line(outcome: &update::Outcome, fold_up_to_date: bool) -> bool {
+    match outcome {
+        update::Outcome::NotInstalled => false,
+        update::Outcome::UpToDate { .. } => !fold_up_to_date,
+        _ => true,
+    }
+}
+
+fn print_outcome_line(tool: &str, outcome: &update::Outcome, width: usize) {
+    let (green, reset) = if color_enabled(&std::io::stdout()) {
+        ("\x1b[32m", "\x1b[0m")
+    } else {
+        ("", "")
+    };
+    let label = format!("{tool}:");
+    let text = describe_outcome(outcome);
+    if matches!(outcome, update::Outcome::Updated { .. }) {
+        println!("{label:<width$} {green}{text}{reset}");
+    } else {
+        println!("{label:<width$} {text}");
+    }
+}
+
+/// Batch mode shows only a counter while tools run; this prints each result
+/// above it as it lands, like `rig install`. Returns whether a line printed.
+fn print_live_report(report: &update::Report, fold_up_to_date: bool) -> bool {
+    if output::streaming() {
+        return false;
+    }
+    match &report.outcome {
+        Ok(outcome) if shows_line(outcome, fold_up_to_date) => {
+            output::clear_line();
+            print_outcome_line(&report.tool, outcome, 0);
+            true
+        }
+        Ok(_) => false,
+        Err(_) => {
+            let (red, reset) = if color_enabled(&std::io::stderr()) {
+                ("\x1b[1;31m", "\x1b[0m")
+            } else {
+                ("", "")
+            };
+            output::clear_line();
+            eprintln!("{red}{}:{reset} failed, details below", report.tool);
+            false
+        }
+    }
 }
 
 /// Shared by `cmd_update` and `cmd_sync --force`. Failures go last, nearest
-/// the prompt; `fold_up_to_date` reduces those lines to the tally. Returns
-/// whether any report failed.
-fn print_reports(reports: &[update::Report], fold_up_to_date: bool, elapsed: Duration) -> bool {
+/// the prompt; `fold_up_to_date` reduces those lines to the tally, and tools
+/// in `live` already printed theirs. Returns whether any report failed.
+fn print_reports(
+    reports: &[update::Report],
+    fold_up_to_date: bool,
+    live: &HashSet<String>,
+    elapsed: Duration,
+) -> bool {
     // `update_all` returns completion order, i.e. network-latency order —
     // sorted so two runs of the same command produce comparable output.
     let mut reports: Vec<&update::Report> = reports.iter().collect();
@@ -496,38 +556,17 @@ fn print_reports(reports: &[update::Report], fold_up_to_date: bool, elapsed: Dur
     let shown: Vec<(&str, &update::Outcome)> = ok
         .iter()
         .filter_map(|r| Some((r.tool.as_str(), r.outcome.as_ref().ok()?)))
-        .filter(|(_, o)| !(fold && matches!(o, update::Outcome::UpToDate { .. })))
-        .filter(|(_, o)| !matches!(o, update::Outcome::NotInstalled))
-        .collect();
-    // One line for all of them: a config full of tools installed elsewhere
-    // would otherwise bury the real results.
-    let not_installed: Vec<&str> = ok
-        .iter()
-        .filter(|r| matches!(r.outcome, Ok(update::Outcome::NotInstalled)))
-        .map(|r| r.tool.as_str())
+        .filter(|(t, o)| shows_line(o, fold) && !live.contains(*t))
         .collect();
 
-    let color = color_enabled(&std::io::stdout());
-    let (green, bold, reset) = if color {
-        ("\x1b[32m", "\x1b[1m", "\x1b[0m")
+    let (bold, reset) = if color_enabled(&std::io::stdout()) {
+        ("\x1b[1m", "\x1b[0m")
     } else {
-        ("", "", "")
+        ("", "")
     };
     let width = shown.iter().map(|(t, _)| t.len() + 1).max().unwrap_or(0);
     for (tool, outcome) in &shown {
-        let label = format!("{tool}:");
-        let text = describe_outcome(outcome);
-        if matches!(outcome, update::Outcome::Updated { .. }) {
-            println!("{label:<width$} {green}{text}{reset}");
-        } else {
-            println!("{label:<width$} {text}");
-        }
-    }
-    if !not_installed.is_empty() {
-        println!(
-            "not installed by rig (skipped): {} — `rig install <tool>` to manage",
-            not_installed.join(", ")
-        );
+        print_outcome_line(tool, outcome, width);
     }
     for report in &failed {
         if let Err(e) = &report.outcome {
@@ -673,6 +712,7 @@ fn cmd_sync(force: bool) -> anyhow::Result<ExitCode> {
     let mut failed = false;
     if force {
         let started = Instant::now();
+        let mut live = HashSet::new();
         let reports = update::update_all(
             &ctx.config,
             &mut ctx.lock,
@@ -681,8 +721,13 @@ fn cmd_sync(force: bool) -> anyhow::Result<ExitCode> {
             true,
             None,
             false,
+            |report| {
+                if print_live_report(report, false) {
+                    live.insert(report.tool.clone());
+                }
+            },
         );
-        failed |= print_reports(&reports, false, started.elapsed());
+        failed |= print_reports(&reports, false, &live, started.elapsed());
     }
 
     let old_keys = fs::read_to_string(&ctx.layout.init_zsh_path)

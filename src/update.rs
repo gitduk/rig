@@ -83,7 +83,9 @@ fn apply_change(lock: &mut Lock, key: &str, change: LockChange) {
 
 /// `filter`: `None` = all configured tools (`rig update`); `Some(names)` =
 /// only those lock keys (`rig update <tool...>`). `verbose` forces
-/// streaming output even when several tools run in parallel.
+/// streaming output even when several tools run in parallel. `on_report`
+/// sees each worker result as it lands, before it joins the returned list.
+#[allow(clippy::too_many_arguments)]
 pub fn update_all(
     config: &Config,
     lock: &mut Lock,
@@ -92,6 +94,7 @@ pub fn update_all(
     refresh_eval: bool,
     filter: Option<&[String]>,
     verbose: bool,
+    mut on_report: impl FnMut(&Report),
 ) -> Vec<Report> {
     // Resolve names like `rig install` does (key, full name or bin name);
     // a name matching no entry must fail, not silently drop out.
@@ -195,6 +198,7 @@ pub fn update_all(
                     outcome: Err(e),
                 },
             };
+            on_report(&report);
             reports.push(report);
         },
     );
@@ -585,7 +589,16 @@ mod tests {
 
         // Unfiltered: curl is excluded, so nothing runs (the url above must
         // never be fetched) and nothing reports.
-        let reports = update_all(&config, &mut lock, &layout, false, false, None, false);
+        let reports = update_all(
+            &config,
+            &mut lock,
+            &layout,
+            false,
+            false,
+            None,
+            false,
+            |_| {},
+        );
         assert!(reports.is_empty());
     }
 
@@ -601,7 +614,16 @@ mod tests {
         let mut lock = Lock::default();
 
         // Blanket: skipped, never reaching apt-get.
-        let reports = update_all(&config, &mut lock, &layout, false, false, None, false);
+        let reports = update_all(
+            &config,
+            &mut lock,
+            &layout,
+            false,
+            false,
+            None,
+            false,
+            |_| {},
+        );
         assert_eq!(reports.len(), 1);
         assert!(matches!(reports[0].outcome, Ok(Outcome::NotInstalled)));
 
@@ -615,6 +637,7 @@ mod tests {
             false,
             Some(&filter),
             false,
+            |_| {},
         );
         let message = reports[0].outcome.as_ref().unwrap_err().to_string();
         assert!(message.contains("not installed by rig"));
@@ -636,6 +659,7 @@ mod tests {
             false,
             Some(&filter),
             false,
+            |_| {},
         );
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].tool, "hi");
