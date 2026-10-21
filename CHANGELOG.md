@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Changed
+
+- Parallel `rig update` on a terminal prints each tool's result above the
+  live counter as it lands, like `rig install`; failures get a one-line
+  notice there and their details at the end. The summary no longer repeats
+  those lines, and the "not installed by rig (skipped)" list is gone (its
+  count stays in the tally).
+
+## 1.1.0 - 2026-10-21
+
 ### Breaking
 
 - **Archives with a single top-level directory are unwrapped.** `[[repo]]`
@@ -12,6 +22,35 @@
   `"*/ccs"`, `setcap ... */sing-box`) must drop it. Installed versions keep
   their layout until the next update, and a failing glob leaves the old
   version live.
+
+### Changed
+
+- Installs and updates clean up after themselves. Once the new version is
+  recorded in `rig.lock`, every other entry in that tool's `pkg/<tool>/`
+  dir (superseded versions, interrupted `.partial`s) is deleted, and the
+  downloaded archive is removed from `cache/` right after unpacking. Rolling
+  back now means re-downloading. Existing piles shrink on each tool's next
+  update; `cache/` leftovers from older rigs can be deleted by hand.
+
+## 1.0.5 - 2026-10-19
+
+### Changed
+
+- `rig update --self` no longer uses the GitHub API, so it can't hit the
+  60 requests/hour anonymous limit. It reads the latest tag from the
+  release page redirect and checks the archive against its `.sha256` file.
+
+### Added
+
+- GitHub release lookups send a token from `GITHUB_TOKEN`, `GH_TOKEN`, or
+  `gh auth token`, raising the API limit from 60 to 5000 requests/hour.
+- `rig update --self` and the `rig.zsh` bootstrap support aarch64 Linux and
+  x86_64/aarch64 macOS, not just x86_64 Linux.
+
+## 1.0.2 - 2026-10-18
+
+### Breaking
+
 - **`setup` hooks now run under `sh -e`.** The first failing command fails
   the hook. Previously only the last command's exit status counted, so
   `mv a .; mv b .; rm -rf */` reported success even when both `mv`s failed.
@@ -25,17 +64,6 @@
 
 ### Changed
 
-- Parallel `rig update` on a terminal prints each tool's result above the
-  live counter as it lands, like `rig install`; failures get a one-line
-  notice there and their details at the end. The summary no longer repeats
-  those lines, and the "not installed by rig (skipped)" list is gone (its
-  count stays in the tally).
-- Installs and updates clean up after themselves. Once the new version is
-  recorded in `rig.lock`, every other entry in that tool's `pkg/<tool>/`
-  dir (superseded versions, interrupted `.partial`s) is deleted, and the
-  downloaded archive is removed from `cache/` right after unpacking. Rolling
-  back now means re-downloading. Existing piles shrink on each tool's next
-  update; `cache/` leftovers from older rigs can be deleted by hand.
 - `rig install` / `rig update` output for parallel runs on a terminal: one
   live progress line instead of interleaved step logs; child process output
   (builds, `git`, install scripts, setup hooks) is captured and shown, last
@@ -46,16 +74,9 @@
 - Update progress lines show both versions: `updating 1.58.0 -> 1.59.0`.
 - `[[apt]]` tools run first, one at a time, with the terminal attached so
   `sudo` can prompt.
-- `rig update --self` no longer uses the GitHub API, so it can't hit the
-  60 requests/hour anonymous limit. It reads the latest tag from the
-  release page redirect and checks the archive against its `.sha256` file.
 
 ### Added
 
 - `-v` / `--verbose` on `rig install` and `rig update`: stream every step
   and child output live, as before. A single tool, or non-terminal output,
   streams by default.
-- GitHub release lookups send a token from `GITHUB_TOKEN`, `GH_TOKEN`, or
-  `gh auth token`, raising the API limit from 60 to 5000 requests/hour.
-- `rig update --self` and the `rig.zsh` bootstrap support aarch64 Linux and
-  x86_64/aarch64 macOS, not just x86_64 Linux.
