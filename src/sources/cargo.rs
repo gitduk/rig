@@ -2,7 +2,6 @@
 //! location is set via `--root` (a CLI flag, not an inherited env var) —
 //! it never depends on what the caller's shell happens to have.
 
-use std::fs;
 use std::process::Command;
 
 use anyhow::Context;
@@ -14,7 +13,8 @@ use crate::paths::Layout;
 use crate::version::crates_io;
 
 use super::{
-    Phase, apply_env, collect_artifacts, finalize_partial, run_child, run_setup, tool_key,
+    Phase, apply_env, collect_artifacts, finalize_partial, remove_stale_dir, run_child, run_setup,
+    tool_key,
 };
 use crate::output::progress;
 
@@ -36,10 +36,7 @@ pub fn install(
     let tool_dir = layout.tool_pkg_dir(tool);
     let final_dir = layout.pkg_dir(tool, &version);
     let partial_dir = tool_dir.join(format!("{version}.partial"));
-    if partial_dir.exists() {
-        fs::remove_dir_all(&partial_dir)
-            .with_context(|| format!("failed to remove stale {}", partial_dir.display()))?;
-    }
+    remove_stale_dir(&partial_dir)?;
 
     let mut command = Command::new("cargo");
     command
@@ -101,6 +98,7 @@ pub fn install(
 mod tests {
     use super::*;
     use crate::config::{self, Common, CompletionsSpec};
+    use std::fs;
 
     fn ripgrep_entry() -> CargoEntry {
         CargoEntry {

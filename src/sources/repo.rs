@@ -81,11 +81,6 @@ pub fn install(
     let tool_dir = layout.tool_pkg_dir(tool);
     let final_dir = layout.pkg_dir(tool, &release.tag);
     let partial_dir = tool_dir.join(format!("{}.partial", release.tag));
-    if partial_dir.exists() {
-        fs::remove_dir_all(&partial_dir)
-            .with_context(|| format!("failed to remove stale {}", partial_dir.display()))?;
-    }
-
     extract(&cache_path, &partial_dir, entry.extract)
         .with_context(|| format!("failed to extract {}", asset.name))?;
 

@@ -2,7 +2,6 @@
 //! binary (SIM-1: no `git2`, `git` is already on the system).
 
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::Path;
 use std::process::Command;
 
@@ -16,8 +15,8 @@ use crate::paths::Layout;
 use crate::version::display_version;
 
 use super::{
-    Phase, apply_env, collect_artifacts, finalize_partial, git_head_commit, run_child, run_setup,
-    tool_key,
+    Phase, apply_env, collect_artifacts, finalize_partial, git_head_commit, remove_stale_dir,
+    run_child, run_setup, tool_key,
 };
 
 fn clone_url(host: Host, name: &str) -> String {
@@ -67,10 +66,7 @@ pub fn install(
     let tool_dir = layout.tool_pkg_dir(tool);
 
     let partial_dir = tool_dir.join("clone.partial");
-    if partial_dir.exists() {
-        fs::remove_dir_all(&partial_dir)
-            .with_context(|| format!("failed to remove stale {}", partial_dir.display()))?;
-    }
+    remove_stale_dir(&partial_dir)?;
     // The new commit is only known after cloning, so updates show `from`.
     match phase {
         Phase::Install => progress!("{tool}: installing via git clone ({})", entry.name),
@@ -136,6 +132,7 @@ pub fn install(
 mod tests {
     use super::*;
     use crate::config::{self, BinSpec, Common, CompletionsSpec};
+    use std::fs;
 
     #[test]
     fn clone_url_dispatches_by_host() {

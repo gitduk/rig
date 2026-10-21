@@ -303,10 +303,7 @@ fn to_hex(bytes: &[u8]) -> String {
 /// Symlinks repoint only after success — clear any stale `final_dir`,
 /// then atomically rename `.partial` into place.
 pub fn finalize_partial(partial_dir: &Path, final_dir: &Path) -> anyhow::Result<()> {
-    if final_dir.exists() {
-        fs::remove_dir_all(final_dir)
-            .with_context(|| format!("failed to remove stale {}", final_dir.display()))?;
-    }
+    remove_stale_dir(final_dir)?;
     fs::rename(partial_dir, final_dir).with_context(|| {
         format!(
             "failed to move {} into place at {}",
@@ -316,9 +313,19 @@ pub fn finalize_partial(partial_dir: &Path, final_dir: &Path) -> anyhow::Result<
     })
 }
 
-/// Dispatches by extension; `extract_flag = Some(false)` means a raw
-/// binary, copied as-is rather than unpacked. No checksum verification.
+/// Removes `dir` and everything in it if present; a missing `dir` is fine.
+pub fn remove_stale_dir(dir: &Path) -> anyhow::Result<()> {
+    if dir.exists() {
+        fs::remove_dir_all(dir)
+            .with_context(|| format!("failed to remove stale {}", dir.display()))?;
+    }
+    Ok(())
+}
+
+/// Dispatches by extension into a freshly emptied `dest`; `extract_flag =
+/// Some(false)` copies a raw binary as-is. No checksum verification.
 pub fn extract(archive: &Path, dest: &Path, extract_flag: Option<bool>) -> anyhow::Result<()> {
+    remove_stale_dir(dest)?;
     fs::create_dir_all(dest).with_context(|| format!("failed to create {}", dest.display()))?;
 
     if extract_flag == Some(false) {
@@ -331,14 +338,66 @@ pub fn extract(archive: &Path, dest: &Path, extract_flag: Option<bool>) -> anyho
         .unwrap_or_default();
 
     if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
-        extract_tar_gz(archive, dest)
+        extract_tar_gz(archive, dest)?;
     } else if name.ends_with(".zip") {
-        extract_zip(archive, dest)
+        extract_zip(archive, dest)?;
     } else if name.ends_with(".deb") {
-        extract_deb(archive, dest)
+        // A .deb's lone `usr/` is an install path, not a wrapper — keep it.
+        return extract_deb(archive, dest);
     } else {
         bail!("don't know how to extract {name}; set `extract = false` if this is a raw binary")
     }
+    unwrap_single_root(dest)
+}
+
+/// Archiver droppings, dropped before deciding whether an archive is
+/// wrapped in a single top-level directory.
+const ARCHIVE_JUNK: &[&str] = &["__MACOSX", ".DS_Store", "Thumbs.db"];
+
+/// Lifts a lone top-level dir into `dest`, so `bin` and `setup` paths
+/// ignore how upstream wrapped a release.
+fn unwrap_single_root(dest: &Path) -> anyhow::Result<()> {
+    let mut content = Vec::new();
+    for entry in fs::read_dir(dest).with_context(|| format!("failed to read {}", dest.display()))? {
+        let entry = entry.with_context(|| format!("failed to read entry in {}", dest.display()))?;
+        if !ARCHIVE_JUNK.iter().any(|j| entry.file_name() == *j) {
+            content.push(entry);
+            continue;
+        }
+        let path = entry.path();
+        let removed = if path.is_dir() {
+            fs::remove_dir_all(&path)
+        } else {
+            fs::remove_file(&path)
+        };
+        removed.with_context(|| format!("failed to remove {}", path.display()))?;
+    }
+    let [root] = content.as_slice() else {
+        return Ok(());
+    };
+    // `DirEntry::file_type` doesn't follow symlinks: a lone symlink stays put.
+    let is_dir = root
+        .file_type()
+        .with_context(|| format!("failed to stat {}", root.path().display()))?
+        .is_dir();
+    if !is_dir {
+        return Ok(());
+    }
+
+    // Moving the wrapper aside first lets a child share its name (`foo/foo`).
+    let staged = dest.join(".rig-unwrap");
+    fs::rename(root.path(), &staged)
+        .with_context(|| format!("failed to move {} aside", root.path().display()))?;
+    for entry in
+        fs::read_dir(&staged).with_context(|| format!("failed to read {}", staged.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("failed to read entry in {}", staged.display()))?;
+        let target = dest.join(entry.file_name());
+        fs::rename(entry.path(), &target)
+            .with_context(|| format!("failed to move {} up", target.display()))?;
+    }
+    fs::remove_dir(&staged).with_context(|| format!("failed to remove {}", staged.display()))
 }
 
 /// `.deb` is an `ar` archive wrapping `data.tar.*` — `dpkg-deb -x` unpacks
@@ -1010,6 +1069,92 @@ mod tests {
             .expect("`sh` should resolve via ambient PATH");
 
         assert!(resolved.ends_with("/sh"));
+    }
+
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .expect("read dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn extract_unwraps_a_tarball_with_a_single_root_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let archive = tmp.path().join("bat.tar.gz");
+        let gz = flate2::write::GzEncoder::new(
+            fs::File::create(&archive).expect("create archive"),
+            flate2::Compression::default(),
+        );
+        let mut builder = tar::Builder::new(gz);
+        for path in ["bat-v1/bat", "bat-v1/autocomplete/bat.zsh"] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(1);
+            header.set_mode(0o755);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, path, &b"x"[..])
+                .expect("append entry");
+        }
+        builder
+            .into_inner()
+            .expect("finish tar")
+            .finish()
+            .expect("finish gzip");
+
+        let dest = tmp.path().join("dest");
+        extract(&archive, &dest, None).expect("extract should succeed");
+
+        assert_eq!(names_in(&dest), ["autocomplete", "bat"]);
+        assert!(dest.join("autocomplete/bat.zsh").is_file());
+    }
+
+    #[test]
+    fn unwrap_single_root_handles_a_child_named_like_its_wrapper() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        fs::create_dir_all(tmp.path().join("foo/doc")).expect("mkdir");
+        fs::write(tmp.path().join("foo/foo"), b"bin").expect("write bin");
+
+        unwrap_single_root(tmp.path()).expect("unwrap should succeed");
+
+        assert_eq!(names_in(tmp.path()), ["doc", "foo"]);
+        assert!(tmp.path().join("foo").is_file());
+    }
+
+    #[test]
+    fn unwrap_single_root_ignores_and_drops_archiver_junk() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        fs::create_dir_all(tmp.path().join("__MACOSX/foo")).expect("mkdir junk");
+        fs::write(tmp.path().join(".DS_Store"), b"").expect("write junk");
+        fs::create_dir(tmp.path().join("foo")).expect("mkdir root");
+        fs::write(tmp.path().join("foo/foo"), b"bin").expect("write bin");
+
+        unwrap_single_root(tmp.path()).expect("unwrap should succeed");
+
+        assert_eq!(names_in(tmp.path()), ["foo"]);
+        assert!(tmp.path().join("foo").is_file());
+    }
+
+    #[test]
+    fn unwrap_single_root_leaves_other_layouts_alone() {
+        let several = tempfile::tempdir().expect("tempdir");
+        fs::create_dir(several.path().join("a")).expect("mkdir");
+        fs::write(several.path().join("b"), b"").expect("write");
+        fs::write(several.path().join(".DS_Store"), b"").expect("write junk");
+        unwrap_single_root(several.path()).expect("unwrap should succeed");
+        assert_eq!(names_in(several.path()), ["a", "b"]);
+
+        let lone_file = tempfile::tempdir().expect("tempdir");
+        fs::write(lone_file.path().join("tool"), b"").expect("write");
+        unwrap_single_root(lone_file.path()).expect("unwrap should succeed");
+        assert_eq!(names_in(lone_file.path()), ["tool"]);
+
+        let lone_link = tempfile::tempdir().expect("tempdir");
+        std::os::unix::fs::symlink(several.path(), lone_link.path().join("link")).expect("symlink");
+        unwrap_single_root(lone_link.path()).expect("unwrap should succeed");
+        assert_eq!(names_in(lone_link.path()), ["link"]);
     }
 
     #[test]

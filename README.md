@@ -107,7 +107,7 @@ run = "_zsh_autosuggest_start"
 
 | Source | What rig does | Version source |
 | --- | --- | --- |
-| `[[repo]]` | Picks a release asset (explicit `bpick` glob or host-arch/os auto-match), downloads, extracts, symlinks bins | GitHub/Codeberg release |
+| `[[repo]]` | Picks a release asset (explicit `bpick` glob or host-arch/os auto-match), downloads, extracts (a lone top-level dir is unwrapped), symlinks bins | GitHub/Codeberg release |
 | `[[git]]` | Clones, runs `setup` (build), symlinks bins | git HEAD |
 | `[[cargo]]` | `cargo install` | crates.io |
 | `[[node]]` | `bun add -g` / `npm i -g` (`manager = auto` probes bun first) | npm registry |
@@ -124,7 +124,7 @@ share these fields (plus their own: `host`/`bpick`/`extract` on `[[repo]]`,
 | Field | Description |
 | --- | --- |
 | `description` | Shown by `rig list`. |
-| `bin` | Command name(s) to expose. `"name"`, a list, or a map of path-glob → command. Defaults to the last path segment of `name`. |
+| `bin` | Command name(s) to expose. `"name"`, a list, or a map of path-glob → command (paths are relative to the unwrapped archive root). Defaults to the last path segment of `name`. |
 | `env` | Environment variables exported in `init.zsh` (or at first use with `lazy`). Leading `~` is expanded and the rest escaped. |
 | `eval` | Shell to run at startup, e.g. `"zoxide init zsh"`. Plain string, or `{ cmd, cache }` to force cacheability. |
 | `run` | Plain shell text (aliases, etc.) run verbatim, never captured — single line, list, or a `'''...'''` block. |

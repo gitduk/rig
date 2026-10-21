@@ -4,6 +4,14 @@
 
 ### Breaking
 
+- **Archives with a single top-level directory are unwrapped.** `[[repo]]`
+  tarballs and zips like `bat-v0.26.1-x86_64-unknown-linux-gnu/bat` now land
+  as `bat`, the same as `tar --strip-components=1` (`__MACOSX`, `.DS_Store`
+  and `Thumbs.db` are ignored and dropped; `.deb` is never unwrapped). Path
+  `bin` globs and `setup` paths that named the wrapper (`"bat-*/bat"`,
+  `"*/ccs"`, `setcap ... */sing-box`) must drop it. Installed versions keep
+  their layout until the next update, and a failing glob leaves the old
+  version live.
 - **`setup` hooks now run under `sh -e`.** The first failing command fails
   the hook. Previously only the last command's exit status counted, so
   `mv a .; mv b .; rm -rf */` reported success even when both `mv`s failed.

@@ -190,8 +190,7 @@ pub fn update_self(force: bool, layout: &Layout, lock: &mut Lock) -> anyhow::Res
         .with_context(|| format!("failed to download {archive}"))?;
     sources::extract(&tmp_tar, &tmp_dir, None)
         .with_context(|| format!("failed to unpack {archive}"))?;
-    // dist tarballs nest the binary one level down: `rig-<target>/rig`.
-    let tmp_bin = tmp_dir.join(format!("rig-{target}")).join("rig");
+    let tmp_bin = tmp_dir.join("rig");
     if let Err(e) = sources::run_version_smoke(&tmp_bin, "rig") {
         fs::remove_file(&tmp_tar).ok();
         fs::remove_dir_all(&tmp_dir).ok();
