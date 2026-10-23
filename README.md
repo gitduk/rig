@@ -138,7 +138,7 @@ share these fields (plus their own: `host`/`bpick`/`extract` on `[[repo]]`,
 | Command | Alias | Description |
 | --- | --- | --- |
 | `rig install <tool...>` | `i` | Install tools (folds in an update check for already-installed ones). `-v`/`--verbose` streams every step (see below). |
-| `rig update [tool...]` | `u` | Update everything, or just the named tools. Unfiltered runs skip `[[curl]]` tools — their scripts rerun only when named. `-f`/`--force` reinstalls. `-v`/`--verbose` streams every step. `--self` updates rig itself (binary + bootstrap), no config entry needed. |
+| `rig update [tool...]` | `u` | Update everything, or just the named tools. Unfiltered runs skip `[[curl]]` tools — their scripts rerun only when named. `-f`/`--force` reinstalls. `-v`/`--verbose` streams every step. `-c`/`--check` only reports which tools have a newer version — read-only, no install; exits 2 when any are outdated (1 on errors). `--self` updates rig itself (binary + bootstrap), no config entry needed. |
 
 | `rig remove <tool...>` | `rm` | Remove a tool's rig-owned files and lock entry. |
 | `rig list` | `ls` | Configured tools, marked installed/not. |

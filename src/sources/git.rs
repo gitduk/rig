@@ -19,7 +19,7 @@ use super::{
     run_child, run_setup, tool_key,
 };
 
-fn clone_url(host: Host, name: &str) -> String {
+pub(super) fn clone_url(host: Host, name: &str) -> String {
     match host {
         Host::Github => format!("https://github.com/{name}.git"),
         Host::Codeberg => format!("https://codeberg.org/{name}.git"),

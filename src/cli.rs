@@ -45,6 +45,9 @@ enum Command {
         tools: Vec<String>,
         #[arg(short, long)]
         force: bool,
+        /// Only report which tools have a newer version; exits 2 if any do
+        #[arg(short, long, conflicts_with_all = ["force", "self_update"])]
+        check: bool,
         /// Print every step and child output live, even for parallel runs
         #[arg(short, long, conflicts_with = "self_update")]
         verbose: bool,
@@ -189,9 +192,17 @@ fn dispatch(command: Command) -> anyhow::Result<ExitCode> {
         Command::Update {
             tools,
             force,
+            check,
             verbose,
             self_update: false,
-        } => cmd_update(tools, force, verbose),
+        } => {
+            let mode = if check {
+                update::Mode::Check
+            } else {
+                update::Mode::Update { force }
+            };
+            cmd_update(tools, mode, verbose)
+        }
         Command::Remove { tools } => cmd_remove(tools),
         Command::List => cmd_list().map(|()| ExitCode::SUCCESS),
         Command::Sync { force } => cmd_sync(force),
@@ -457,8 +468,14 @@ fn cmd_self_update(force: bool) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn cmd_update(tools: Vec<String>, force: bool, verbose: bool) -> anyhow::Result<ExitCode> {
-    let _state_lock = acquire_state_lock()?;
+fn cmd_update(tools: Vec<String>, mode: update::Mode, verbose: bool) -> anyhow::Result<ExitCode> {
+    let checking = matches!(mode, update::Mode::Check);
+    // A check only reads, so it needn't queue behind a running install.
+    let _state_lock = if checking {
+        None
+    } else {
+        Some(acquire_state_lock()?)
+    };
     let mut ctx = Ctx::load()?;
     let filter = (!tools.is_empty()).then_some(tools.as_slice());
     // Named tools always get an answer; a blanket run folds "up to date".
@@ -476,8 +493,7 @@ fn cmd_update(tools: Vec<String>, force: bool, verbose: bool) -> anyhow::Result<
         &ctx.config,
         &mut ctx.lock,
         &ctx.layout,
-        force,
-        false,
+        mode,
         filter,
         verbose,
         |report| {
@@ -487,9 +503,14 @@ fn cmd_update(tools: Vec<String>, force: bool, verbose: bool) -> anyhow::Result<
         },
     );
 
+    let outdated = reports
+        .iter()
+        .any(|r| matches!(r.outcome, Ok(update::Outcome::Outdated { .. })));
     Ok(
         if print_reports(&reports, fold, &live, width, started.elapsed()) {
             ExitCode::FAILURE
+        } else if outdated {
+            ExitCode::from(2)
         } else {
             ExitCode::SUCCESS
         },
@@ -500,7 +521,7 @@ fn cmd_update(tools: Vec<String>, force: bool, verbose: bool) -> anyhow::Result<
 fn shows_line(outcome: &update::Outcome, fold_up_to_date: bool) -> bool {
     match outcome {
         update::Outcome::NotInstalled => false,
-        update::Outcome::UpToDate { .. } => !fold_up_to_date,
+        update::Outcome::UpToDate { .. } | update::Outcome::Unknown => !fold_up_to_date,
         _ => true,
     }
 }
@@ -526,7 +547,10 @@ fn print_result_line(tool: &str, text: &str, changed: bool, width: usize) {
 }
 
 fn print_outcome_line(tool: &str, outcome: &update::Outcome, width: usize) {
-    let changed = matches!(outcome, update::Outcome::Updated { .. });
+    let changed = matches!(
+        outcome,
+        update::Outcome::Updated { .. } | update::Outcome::Outdated { .. }
+    );
     print_result_line(tool, &describe_outcome(outcome), changed, width);
 }
 
@@ -599,11 +623,13 @@ fn print_reports(
     if reports.len() > 1 {
         const ORDER: &[&str] = &[
             "updated",
+            "outdated",
             "reinstalled",
             "rerun",
             "eval refreshed",
             "no eval",
             "up to date",
+            "unknown",
             "not installed",
             "failed",
         ];
@@ -612,6 +638,8 @@ fn print_reports(
                 Ok(update::Outcome::Updated { from, to }) => {
                     sources::Phase::Update { from }.done_verb(to)
                 }
+                Ok(update::Outcome::Outdated { .. }) => "outdated",
+                Ok(update::Outcome::Unknown) => "unknown",
                 Ok(update::Outcome::Reran) => "rerun",
                 Ok(update::Outcome::EvalRefreshed { .. }) => "eval refreshed",
                 Ok(update::Outcome::NoEval) => "no eval",
@@ -644,6 +672,12 @@ fn describe_outcome(outcome: &update::Outcome) -> String {
             format!("up to date ({})", display_version(version))
         }
         update::Outcome::Updated { from, to } => sources::Phase::Update { from }.describe_done(to),
+        update::Outcome::Outdated { from, to } => format!(
+            "outdated {} -> {}",
+            display_version(from),
+            display_version(to)
+        ),
+        update::Outcome::Unknown => "no version to check".to_string(),
         update::Outcome::Reran => "rerun".to_string(),
         update::Outcome::EvalRefreshed { cacheable } => {
             let label = match cacheable {
@@ -755,8 +789,7 @@ fn cmd_sync(force: bool) -> anyhow::Result<ExitCode> {
             &ctx.config,
             &mut ctx.lock,
             &ctx.layout,
-            false,
-            true,
+            update::Mode::RefreshEval,
             None,
             false,
             |report| {

@@ -1,7 +1,6 @@
 //! Update flow, reusing each source type's `sources::*::install`.
-//! repo/git/cargo/node check a cheap version query against `rig.lock`
-//! first and skip when current; apt compares against its local candidate
-//! the same way; curl always reruns, so an unfiltered
+//! repo/git/cargo/node/apt gate on `check`'s version query against
+//! `rig.lock` and skip when current; curl always reruns, so an unfiltered
 //! `rig update` skips it — only `rig update <tool>` reaches it.
 
 use anyhow::{anyhow, bail};
@@ -16,6 +15,17 @@ use crate::pool;
 use crate::sources;
 use crate::version;
 
+/// What `update_all` does with each tool.
+#[derive(Clone, Copy)]
+pub enum Mode {
+    /// `rig update`; `force` reinstalls even when current.
+    Update { force: bool },
+    /// `rig update --check`: query versions only, change nothing.
+    Check,
+    /// `rig sync --force`: re-probe `eval` cacheability in place.
+    RefreshEval,
+}
+
 #[derive(Debug)]
 pub enum Outcome {
     UpToDate {
@@ -25,6 +35,14 @@ pub enum Outcome {
         from: String,
         to: String,
     },
+    /// `--check` only: a newer version exists upstream.
+    Outdated {
+        from: String,
+        to: String,
+    },
+    /// `--check` only: the source exposes no version to compare (curl, or
+    /// apt without a readable candidate).
+    Unknown,
     /// `[[curl]]`: no version to compare (reliability "depends on the
     /// script"), so every call reruns it rather than guessing staleness.
     /// Blanket `rig update` keeps curl out; this only fires on an
@@ -85,13 +103,11 @@ fn apply_change(lock: &mut Lock, key: &str, change: LockChange) {
 /// only those lock keys (`rig update <tool...>`). `verbose` forces
 /// streaming output even when several tools run in parallel. `on_report`
 /// sees each worker result as it lands, before it joins the returned list.
-#[allow(clippy::too_many_arguments)]
 pub fn update_all(
     config: &Config,
     lock: &mut Lock,
     layout: &Layout,
-    force: bool,
-    refresh_eval: bool,
+    mode: Mode,
     filter: Option<&[String]>,
     verbose: bool,
     mut on_report: impl FnMut(&Report),
@@ -119,7 +135,9 @@ pub fn update_all(
     // would rerun every curl script each time; it only updates when named
     // explicitly (`rig update <tool>`) or via `rig install`'s folded
     // check. apt stays in the blanket run — its candidate check is cheap.
+    // `--check` runs nothing, so curl stays in to be reported as unknown.
     let blanket = filter.is_none();
+    let checking = matches!(mode, Mode::Check);
     // A blanket run can't tell "never installed" from "installed outside
     // rig", so neither is a failure; named tools still error. An untracked
     // plugin clone still goes through, for its `rig sync` hint.
@@ -135,7 +153,9 @@ pub fn update_all(
     // at a time and streaming; everything else goes to the parallel pool.
     let (serial, parallel): (Vec<_>, Vec<_>) = config::all_entries(config)
         .into_iter()
-        .filter(|e| wanted(&e.key()) && !(blanket && matches!(e, ResolvedEntry::Curl(_))))
+        .filter(|e| {
+            wanted(&e.key()) && !(blanket && !checking && matches!(e, ResolvedEntry::Curl(_)))
+        })
         .filter(|e| {
             let skip = blanket && !tracked(e);
             if skip {
@@ -146,7 +166,7 @@ pub fn update_all(
             }
             !skip
         })
-        .partition(|e| e.needs_terminal());
+        .partition(|e| e.needs_terminal() && !checking);
     let as_target = |e: ResolvedEntry<'_>| (e.key(), e.name().to_string());
     let serial: Vec<(String, String)> = serial.into_iter().map(as_target).collect();
     let parallel: Vec<(String, String)> = parallel.into_iter().map(as_target).collect();
@@ -163,7 +183,7 @@ pub fn update_all(
         parallel,
         workers,
         verbose,
-        |(_, name)| update_one(config, &lock_snapshot, layout, name, force, refresh_eval),
+        |(_, name)| update_one(config, &lock_snapshot, layout, name, mode),
         |(tool, _), result| {
             // `Some(change)` is exactly "must persist": every producer pairs
             // a mutating outcome (Updated/Reran/EvalRefreshed) with a change.
@@ -215,25 +235,66 @@ fn update_one(
     lock: &Lock,
     layout: &Layout,
     name: &str,
-    force: bool,
-    refresh_eval: bool,
+    mode: Mode,
 ) -> anyhow::Result<(Outcome, Option<LockChange>)> {
     let entry = config::resolve_tool(config, name)
         .ok_or_else(|| anyhow!("{name} is not in {CONFIG_PATH_HINT}"))?;
     let key = entry.key();
-    if refresh_eval {
-        refresh_eval_cache(&entry, &key, lock)
-    } else {
-        match entry {
-            ResolvedEntry::Repo(e) => update_repo(e, &key, lock, layout, force),
-            ResolvedEntry::Git(e) => update_git(e, &key, lock, layout, force),
-            ResolvedEntry::Cargo(e) => update_cargo(e, &key, lock, layout, force),
-            ResolvedEntry::Node(e) => update_node(e, &key, lock, layout, force),
-            ResolvedEntry::Apt(e) => update_apt(e, &key, lock, layout),
-            ResolvedEntry::Curl(e) => update_curl(e, &key, lock, layout),
-            ResolvedEntry::Plugin(e) => update_plugin(e, &key, lock, layout, force),
+    let force = match mode {
+        Mode::RefreshEval => return refresh_eval_cache(&entry, &key, lock),
+        Mode::Check => return Ok((check(&entry, &key, lock, layout)?, None)),
+        Mode::Update { force } => force,
+    };
+    // Plugin's `git pull` is its own check — a prior ls-remote would double
+    // it. apt ignores `force`: its pre-check is what keeps sudo away.
+    let pre_check = match entry {
+        ResolvedEntry::Plugin(_) => false,
+        ResolvedEntry::Apt(_) => true,
+        _ => !force,
+    };
+    if pre_check {
+        let outcome = check(&entry, &key, lock, layout)?;
+        if matches!(outcome, Outcome::UpToDate { .. }) {
+            return Ok((outcome, None));
         }
     }
+    match entry {
+        ResolvedEntry::Repo(e) => update_repo(e, &key, lock, layout),
+        ResolvedEntry::Git(e) => update_git(e, &key, lock, layout),
+        ResolvedEntry::Cargo(e) => update_cargo(e, &key, lock, layout),
+        ResolvedEntry::Node(e) => update_node(e, &key, lock, layout),
+        ResolvedEntry::Apt(e) => update_apt(e, &key, lock, layout),
+        ResolvedEntry::Curl(e) => update_curl(e, &key, lock, layout),
+        ResolvedEntry::Plugin(e) => update_plugin(e, &key, lock, layout, force),
+    }
+}
+
+/// The version query every pre-checked update gates on, and all that
+/// `rig update --check` runs: read-only, no sudo, no clone, no lock change.
+fn check(
+    entry: &ResolvedEntry,
+    key: &str,
+    lock: &Lock,
+    layout: &Layout,
+) -> anyhow::Result<Outcome> {
+    let current = match entry {
+        ResolvedEntry::Plugin(_) => plugin_version(key, lock, layout)?,
+        _ => already_installed(lock, key)?,
+    };
+    let latest = match entry {
+        ResolvedEntry::Repo(e) => Some(version::github::latest_release(&e.name, e.host)?.tag),
+        ResolvedEntry::Git(e) => Some(sources::git::remote_head_commit(e.host, &e.name)?),
+        ResolvedEntry::Cargo(e) => Some(version::crates_io::latest_version(&e.name)?),
+        ResolvedEntry::Node(e) => Some(version::npm::latest(&e.name)?.version),
+        ResolvedEntry::Apt(e) => sources::apt::candidate_version(&e.name),
+        ResolvedEntry::Curl(_) => None,
+        ResolvedEntry::Plugin(e) => Some(sources::plugin::remote_head_commit(e)?),
+    };
+    Ok(match latest {
+        Some(to) if to == current => Outcome::UpToDate { version: current },
+        Some(to) => Outcome::Outdated { from: current, to },
+        None => Outcome::Unknown,
+    })
 }
 
 /// Folds an update check into `rig install` for an already-installed tool:
@@ -244,7 +305,7 @@ pub fn check_and_update(
     layout: &Layout,
     name: &str,
 ) -> anyhow::Result<Option<ToolLock>> {
-    match update_one(config, lock, layout, name, false, false)? {
+    match update_one(config, lock, layout, name, Mode::Update { force: false })? {
         (_, Some(LockChange::Replace(new))) => Ok(Some(*new)),
         _ => Ok(None),
     }
@@ -295,19 +356,8 @@ fn update_repo(
     key: &str,
     lock: &Lock,
     layout: &Layout,
-    force: bool,
 ) -> anyhow::Result<(Outcome, Option<LockChange>)> {
     let current_version = already_installed(lock, key)?;
-
-    let release = version::github::latest_release(&entry.name, entry.host)?;
-    if !force && release.tag == current_version {
-        return Ok((
-            Outcome::UpToDate {
-                version: current_version,
-            },
-            None,
-        ));
-    }
 
     let new_lock = sources::repo::install(
         entry,
@@ -332,19 +382,8 @@ fn update_git(
     key: &str,
     lock: &Lock,
     layout: &Layout,
-    force: bool,
 ) -> anyhow::Result<(Outcome, Option<LockChange>)> {
     let current_version = already_installed(lock, key)?;
-
-    let latest = sources::git::remote_head_commit(entry.host, &entry.name)?;
-    if !force && latest == current_version {
-        return Ok((
-            Outcome::UpToDate {
-                version: current_version,
-            },
-            None,
-        ));
-    }
 
     let new_lock = sources::git::install(
         entry,
@@ -364,26 +403,13 @@ fn update_git(
     ))
 }
 
-/// This is rig's improvement over bare `cargo install --force`, which has
-/// no version comparison of its own and always recompiles.
 fn update_cargo(
     entry: &CargoEntry,
     key: &str,
     lock: &Lock,
     layout: &Layout,
-    force: bool,
 ) -> anyhow::Result<(Outcome, Option<LockChange>)> {
     let current_version = already_installed(lock, key)?;
-
-    let latest = version::crates_io::latest_version(&entry.name)?;
-    if !force && latest == current_version {
-        return Ok((
-            Outcome::UpToDate {
-                version: current_version,
-            },
-            None,
-        ));
-    }
 
     let new_lock = sources::cargo::install(
         entry,
@@ -408,7 +434,6 @@ fn update_node(
     key: &str,
     lock: &Lock,
     layout: &Layout,
-    force: bool,
 ) -> anyhow::Result<(Outcome, Option<LockChange>)> {
     let current = lock.tool.get(key).ok_or_else(|| not_installed(key))?;
     let current_version = current.version.clone();
@@ -418,16 +443,6 @@ fn update_node(
             .as_deref()
             .ok_or_else(|| anyhow!("{key}'s rig.lock entry has no recorded manager"))?,
     )?;
-
-    let latest = version::npm::latest(&entry.name)?.version;
-    if !force && latest == current_version {
-        return Ok((
-            Outcome::UpToDate {
-                version: current_version,
-            },
-            None,
-        ));
-    }
 
     let new_lock = sources::node::install_with_manager(
         entry,
@@ -448,8 +463,8 @@ fn update_node(
     ))
 }
 
-/// apt's local candidate is the pre-check, so a current package never
-/// touches sudo. No readable candidate falls back to rerunning the install.
+/// `check`'s local candidate keeps a current package away from sudo; no
+/// readable candidate falls back to rerunning the install.
 fn update_apt(
     entry: &AptEntry,
     key: &str,
@@ -457,15 +472,6 @@ fn update_apt(
     layout: &Layout,
 ) -> anyhow::Result<(Outcome, Option<LockChange>)> {
     let current_version = already_installed(lock, key)?;
-    if sources::apt::candidate_version(&entry.name).as_deref() == Some(current_version.as_str()) {
-        return Ok((
-            Outcome::UpToDate {
-                version: current_version,
-            },
-            None,
-        ));
-    }
-
     let new_lock = sources::apt::install(
         entry,
         layout,
@@ -509,7 +515,18 @@ fn update_curl(
     ))
 }
 
-/// No cheap pre-check like `update_repo`'s — `git pull` itself must
+fn plugin_version(key: &str, lock: &Lock, layout: &Layout) -> anyhow::Result<String> {
+    match lock.tool.get(key) {
+        Some(tool) => Ok(tool.version.clone()),
+        // A clone that predates plugin lock tracking — `sync` backfills it.
+        None if layout.plugins_dir.join(key).exists() => {
+            bail!("{key} is cloned but not yet tracked in rig.lock; run `rig sync` first")
+        }
+        None => Err(not_installed(key)),
+    }
+}
+
+/// No pre-check through `check` — `git pull` itself must
 /// contact the remote, so a prior `git ls-remote` would just double that.
 fn update_plugin(
     entry: &PluginEntry,
@@ -518,15 +535,7 @@ fn update_plugin(
     layout: &Layout,
     force: bool,
 ) -> anyhow::Result<(Outcome, Option<LockChange>)> {
-    let current_version = match lock.tool.get(key) {
-        Some(tool) => tool.version.clone(),
-        // A clone that predates plugin lock tracking — `sync` backfills it.
-        None if layout.plugins_dir.join(key).exists() => {
-            bail!("{key} is cloned but not yet tracked in rig.lock; run `rig sync` first")
-        }
-        None => return Err(not_installed(key)),
-    };
-
+    let current_version = plugin_version(key, lock, layout)?;
     let new_lock = sources::plugin::update(entry, layout)?;
     let to = new_lock.version.clone();
     if !force && to == current_version {
@@ -593,13 +602,44 @@ mod tests {
             &config,
             &mut lock,
             &layout,
-            false,
-            false,
+            Mode::Update { force: false },
             None,
             false,
             |_| {},
         );
         assert!(reports.is_empty());
+    }
+
+    #[test]
+    fn check_reports_curl_as_unknown_without_running_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let layout = Layout::new(tmp.path(), "~/.local");
+        let mut config = Config::default();
+        config.curl.push(CurlEntry {
+            name: "oh-my-zsh".to_string(),
+            url: "https://invalid.example/install.sh".to_string(),
+            common: config::test_common(),
+        });
+        let mut lock = Lock::default();
+        lock.tool
+            .insert("oh-my-zsh".to_string(), lock::test_tool_lock());
+
+        // Unfiltered, unlike an update: reported, but the url never fetched.
+        let reports = update_all(
+            &config,
+            &mut lock,
+            &layout,
+            Mode::Check,
+            None,
+            false,
+            |_| {},
+        );
+        assert_eq!(reports.len(), 1);
+        assert!(
+            matches!(reports[0].outcome, Ok(Outcome::Unknown)),
+            "{:?}",
+            reports[0].outcome
+        );
     }
 
     #[test]
@@ -618,8 +658,7 @@ mod tests {
             &config,
             &mut lock,
             &layout,
-            false,
-            false,
+            Mode::Update { force: false },
             None,
             false,
             |_| {},
@@ -633,8 +672,7 @@ mod tests {
             &config,
             &mut lock,
             &layout,
-            false,
-            false,
+            Mode::Update { force: false },
             Some(&filter),
             false,
             |_| {},
@@ -655,8 +693,7 @@ mod tests {
             &config,
             &mut lock,
             &layout,
-            false,
-            false,
+            Mode::Update { force: false },
             Some(&filter),
             false,
             |_| {},
@@ -703,8 +740,12 @@ mod tests {
         let layout = Layout::new(tmp.path(), "~/.local");
         let entry = delta_entry();
 
-        let outcome = update_repo(&entry, "delta", &lock, &layout, false);
+        let outcome = update_repo(&entry, "delta", &lock, &layout);
         assert!(outcome.is_err());
+        assert!(outcome.unwrap_err().to_string().contains("not installed"));
+
+        // `--check` fails the same way, before any network query.
+        let outcome = check(&ResolvedEntry::Repo(&entry), "delta", &lock, &layout);
         assert!(outcome.unwrap_err().to_string().contains("not installed"));
     }
 
@@ -777,13 +818,18 @@ mod tests {
         let installed = sources::repo::install(&entry, &layout, &lock, sources::Phase::Install)
             .expect("initial install");
         lock.tool.insert("delta".to_string(), installed);
+        let mut config = Config::default();
+        config.repo.push(entry);
+        let run = |mode| update_one(&config, &lock, &layout, "dandavison/delta", mode);
 
-        let (outcome, _) =
-            update_repo(&entry, "delta", &lock, &layout, false).expect("update should run");
+        let (outcome, change) = run(Mode::Check).expect("check should run");
+        assert!(matches!(outcome, Outcome::UpToDate { .. }), "{outcome:?}");
+        assert!(change.is_none());
+
+        let (outcome, _) = run(Mode::Update { force: false }).expect("update should run");
         assert!(matches!(outcome, Outcome::UpToDate { .. }), "{outcome:?}");
 
-        let (outcome, _) =
-            update_repo(&entry, "delta", &lock, &layout, true).expect("forced update should run");
+        let (outcome, _) = run(Mode::Update { force: true }).expect("forced update should run");
         assert!(matches!(outcome, Outcome::Updated { .. }), "{outcome:?}");
     }
 }

@@ -9,7 +9,7 @@ use std::process::Command;
 use anyhow::bail;
 use time::OffsetDateTime;
 
-use crate::config::PluginEntry;
+use crate::config::{Host, PluginEntry};
 use crate::lock::ToolLock;
 use crate::output::progress;
 use crate::paths::Layout;
@@ -27,7 +27,7 @@ pub fn install(entry: &PluginEntry, layout: &Layout) -> anyhow::Result<ToolLock>
         tool_key(&entry.name),
         entry.name
     );
-    let url = format!("https://github.com/{}.git", entry.name);
+    let url = super::git::clone_url(Host::Github, &entry.name);
     run_child(
         Command::new("git")
             .args(["clone", "--quiet", &url])
@@ -51,6 +51,11 @@ pub fn update(entry: &PluginEntry, layout: &Layout) -> anyhow::Result<ToolLock> 
         &format!("`git pull` in {}", dest.display()),
     )?;
     build_lock(entry, &dest)
+}
+
+/// The upstream HEAD a `git pull` would land, without touching the clone.
+pub fn remote_head_commit(entry: &PluginEntry) -> anyhow::Result<String> {
+    super::git::remote_head_commit(Host::Github, &entry.name)
 }
 
 /// Reads an already-cloned plugin's current commit into a `ToolLock`
