@@ -3,7 +3,7 @@
 //! module tree, so rig records where it landed rather than relocating it.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, bail};
@@ -161,6 +161,19 @@ fn declared_bin_names(entry: &NodeEntry, info: &npm::NpmInfo) -> Vec<String> {
     }
 }
 
+fn check_bin_conflicts(
+    entry: &NodeEntry,
+    bin_dir: &Path,
+    bin_names: &[String],
+    lock: &Lock,
+) -> anyhow::Result<()> {
+    // Node lock entries use the full package name, including its scope.
+    for name in bin_names {
+        super::check_conflict(&bin_dir.join(name), &entry.name, lock)?;
+    }
+    Ok(())
+}
+
 /// Same rationale as `[[cargo]]`'s `--root`, applied to bun: don't inherit
 /// `$BUN_INSTALL` from whatever the caller's shell happens to have.
 fn install_via_bun(
@@ -179,10 +192,7 @@ fn install_via_bun(
     // untracked-conflict guard collect_bins gives every other source.
     // Deletion is deferred: bun itself replaces the target, and a failed
     // `bun install` must leave the original file untouched.
-    let key = tool_key(&entry.name);
-    for name in bin_names {
-        super::check_conflict(&layout.prefix_bin_dir.join(name), key, lock)?;
-    }
+    check_bin_conflicts(entry, &layout.prefix_bin_dir, bin_names, lock)?;
 
     let mut command = Command::new("bun");
     command
@@ -213,9 +223,7 @@ fn install_via_npm(
     let npm_prefix = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
     let bin_dir = npm_prefix.join("bin");
 
-    for name in bin_names {
-        super::check_conflict(&bin_dir.join(name), tool_key(&entry.name), lock)?;
-    }
+    check_bin_conflicts(entry, &bin_dir, bin_names, lock)?;
 
     let mut command = Command::new("npm");
     command.args(["install", "-g", &format!("{}@{version}", entry.name)]);
@@ -242,6 +250,45 @@ mod tests {
             Ok(ResolvedManager::Npm)
         ));
         assert!(ResolvedManager::parse("yarn").is_err());
+    }
+
+    #[test]
+    fn scoped_package_can_replace_its_own_bin() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bin = tmp.path().join("codex");
+        fs::write(&bin, b"old version").expect("write bin");
+        let entry = NodeEntry {
+            name: "@openai/codex".to_string(),
+            ..cowsay_entry()
+        };
+        let mut lock = Lock::default();
+        let mut installed = crate::lock::test_tool_lock();
+        installed.bins = vec![bin.display().to_string()];
+        lock.tool.insert(entry.name.clone(), installed);
+
+        check_bin_conflicts(&entry, tmp.path(), &["codex".to_string()], &lock)
+            .expect("a scoped package must recognize its own tracked bin");
+        assert_eq!(fs::read(&bin).expect("read bin"), b"old version");
+    }
+
+    #[test]
+    fn scoped_package_cannot_replace_another_scopes_bin() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bin = tmp.path().join("codex");
+        fs::write(&bin, b"other package").expect("write bin");
+        let entry = NodeEntry {
+            name: "@openai/codex".to_string(),
+            ..cowsay_entry()
+        };
+        let mut lock = Lock::default();
+        let mut installed = crate::lock::test_tool_lock();
+        installed.bins = vec![bin.display().to_string()];
+        lock.tool.insert("@other/codex".to_string(), installed);
+
+        let err = check_bin_conflicts(&entry, tmp.path(), &["codex".to_string()], &lock)
+            .expect_err("packages with different scopes must remain distinct owners");
+        assert!(err.to_string().contains("rig tool `@other/codex`"));
+        assert_eq!(fs::read(&bin).expect("read bin"), b"other package");
     }
 
     #[test]
