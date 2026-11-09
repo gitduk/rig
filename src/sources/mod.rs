@@ -147,10 +147,7 @@ pub fn select_asset<'a>(assets: &'a [Asset], bpick: Option<&BpickSpec>) -> Asset
 
     let (matches, bpick_configured) = match bpick {
         Some(spec) => {
-            let patterns: Vec<&str> = match spec {
-                BpickSpec::Single(p) => vec![p.as_str()],
-                BpickSpec::Multiple(ps) => ps.iter().map(String::as_str).collect(),
-            };
+            let patterns = spec.patterns();
             let matches: Vec<&Asset> = assets
                 .iter()
                 .filter(|a| patterns.iter().any(|p| glob_match(p, &a.name)))
@@ -692,6 +689,72 @@ fn confirm_overwrite(tool: &str, target: &Path) -> anyhow::Result<bool> {
 fn answer_is_yes(line: &str) -> bool {
     let answer = line.trim();
     answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes")
+}
+
+/// Interactive tie-break for an ambiguous asset pick: list the candidates
+/// and read the user's choice. Refuses when stdin isn't a TTY so batch
+/// runs keep the hard error instead of hanging.
+pub fn pick_ambiguous<'a>(
+    tool: &str,
+    candidates: &[&'a Asset],
+    bpick_configured: bool,
+) -> anyhow::Result<&'a Asset> {
+    let _guard = CONFIRM_GUARD.lock().expect("prompt guard poisoned");
+    let headline = if bpick_configured {
+        "bpick matches multiple assets"
+    } else {
+        "several release assets match your platform — bpick not set"
+    };
+    let options = list_candidates(candidates);
+
+    if !std::io::stdin().is_terminal() {
+        let remedy = if bpick_configured {
+            "narrow it"
+        } else {
+            "set `bpick`"
+        };
+        bail!("{headline}, {remedy}:{options}");
+    }
+
+    pick_from_list(tool, candidates, headline, &options, |question| {
+        crate::output::prompt(question)
+    })
+}
+
+fn list_candidates(candidates: &[&Asset]) -> String {
+    candidates
+        .iter()
+        .enumerate()
+        .map(|(i, a)| format!("\n  {}) {}", i + 1, a.name))
+        .collect()
+}
+
+/// Reads a choice until it lands on a candidate; `ask` is injected so the
+/// retry and abort paths stay testable.
+fn pick_from_list<'a>(
+    tool: &str,
+    candidates: &[&'a Asset],
+    headline: &str,
+    options: &str,
+    mut ask: impl FnMut(&str) -> std::io::Result<String>,
+) -> anyhow::Result<&'a Asset> {
+    let mut question = format!("{tool}: {headline}, choose one:{options}\n  number> ");
+    loop {
+        let line = ask(&question)?;
+        if let Some(index) = chosen_index(&line, candidates.len()) {
+            return Ok(candidates[index]);
+        }
+        if line.trim().is_empty() {
+            bail!("ambiguous asset pick — nothing chosen, nothing installed");
+        }
+        question = format!("  1-{}> ", candidates.len());
+    }
+}
+
+/// The user's `1..=len` answer as a zero-based index; anything else is none.
+fn chosen_index(line: &str, len: usize) -> Option<usize> {
+    let choice = line.trim().parse::<usize>().ok()?;
+    (1..=len).contains(&choice).then(|| choice - 1)
 }
 
 /// A target that exists but isn't in `rig.lock` belongs to something
@@ -1399,6 +1462,96 @@ mod tests {
         for no in ["n", "no", "N", "", "maybe", "yep"] {
             assert!(!answer_is_yes(no), "{no:?} should not confirm");
         }
+    }
+
+    #[test]
+    fn chosen_index_accepts_a_bounded_number_only() {
+        assert_eq!(chosen_index("2\n", 2), Some(1));
+        assert_eq!(chosen_index(" 1 ", 2), Some(0));
+        assert_eq!(chosen_index("0", 2), None);
+        assert_eq!(chosen_index("3", 2), None);
+        assert_eq!(chosen_index("abc", 2), None);
+        assert_eq!(chosen_index("", 2), None);
+    }
+
+    #[test]
+    fn ambiguous_pick_lists_candidates_when_stdin_is_not_a_tty() {
+        // A real terminal would block on the prompt; only the refusal path
+        // is assertable under `cargo test` piping stdin.
+        if std::io::stdin().is_terminal() {
+            return;
+        }
+        let candidates = vec![
+            asset("DBX_0.6.68-beta.20261107.4_amd64.deb"),
+            asset("DBX_0.6.68_amd64.deb"),
+        ];
+        let refs: Vec<&Asset> = candidates.iter().collect();
+        let err = pick_ambiguous("dbx", &refs, true).expect_err("piped stdin must refuse");
+        let message = err.to_string();
+
+        assert!(message.contains("narrow it"), "unexpected error: {message}");
+        for candidate in &candidates {
+            assert!(
+                message.contains(&candidate.name),
+                "{candidate:?} missing from {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn ambiguous_pick_without_bpick_asks_for_one_instead_of_narrowing() {
+        if std::io::stdin().is_terminal() {
+            return;
+        }
+        let candidates = [
+            asset("delta-x86_64-unknown-linux-gnu.tar.gz"),
+            asset("delta-x86_64-unknown-linux-musl.tar.gz"),
+        ];
+        let refs: Vec<&Asset> = candidates.iter().collect();
+        let err = pick_ambiguous("delta", &refs, false).expect_err("piped stdin must refuse");
+        let message = err.to_string();
+
+        assert!(
+            message.contains("bpick not set") && message.contains("set `bpick`"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn pick_from_list_reprompts_until_a_listed_number() {
+        let candidates = [asset("a.deb"), asset("b.deb")];
+        let refs: Vec<&Asset> = candidates.iter().collect();
+        let mut answers = ["x", "7", "2"].into_iter();
+        let mut asked: Vec<String> = Vec::new();
+
+        let picked = pick_from_list("dbx", &refs, "headline", "\n  1) a.deb", |question| {
+            asked.push(question.to_string());
+            Ok(answers.next().expect("each prompt asks once").to_string())
+        })
+        .expect("a listed number should be accepted");
+
+        assert_eq!(picked.name, "b.deb");
+        assert_eq!(asked.len(), 3);
+        assert!(asked[0].contains("a.deb"), "first ask lists candidates");
+        assert!(
+            !asked[1].contains("a.deb"),
+            "retries must not repeat the list: {}",
+            asked[1]
+        );
+    }
+
+    #[test]
+    fn pick_from_list_aborts_on_an_empty_line() {
+        let candidates = [asset("a.deb"), asset("b.deb")];
+        let refs: Vec<&Asset> = candidates.iter().collect();
+
+        let err = pick_from_list("dbx", &refs, "headline", "", |_| Ok(String::new()))
+            .expect_err("an empty line must abort");
+
+        assert!(
+            err.to_string().contains("nothing installed"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

@@ -211,6 +211,16 @@ pub enum BpickSpec {
     Multiple(Vec<String>),
 }
 
+impl BpickSpec {
+    /// The globs to try, in order — the one expansion every caller uses.
+    pub fn patterns(&self) -> Vec<&str> {
+        match self {
+            Self::Single(pattern) => vec![pattern.as_str()],
+            Self::Multiple(patterns) => patterns.iter().map(String::as_str).collect(),
+        }
+    }
+}
+
 /// `[[repo]]`: GitHub/Codeberg release binaries.
 #[derive(Debug, Deserialize)]
 pub struct RepoEntry {

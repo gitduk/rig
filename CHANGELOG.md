@@ -4,6 +4,11 @@
 
 ### Changed
 
+- An ambiguous release asset is a question instead of a failure: when `bpick`
+  or the platform filter matches several assets, `rig install`/`update` lists
+  them and reads a number from the terminal (a non-TTY run still refuses with
+  the same list). After the pick rig prints the `bpick` that would settle the
+  choice next release, or says plainly that no glob can.
 - Parallel `rig update` on a terminal prints each tool's result above the
   live counter as it lands, like `rig install`; failures get a one-line
   notice there and their details at the end. The summary no longer repeats
@@ -17,6 +22,12 @@
   goes to stderr with its tool name and is no longer appended to or erased
   by the parallel counter; `rig update --self` no longer echoes the new
   build's `--version` output.
+
+### Fixed
+
+- `bpick` suggestions now fire for `v`-prefixed tags: `v0.6.68` was compared
+  verbatim against names like `DBX_0.6.68_amd64.deb`, so a failed asset pick
+  fell back to the raw list instead of proposing a pattern.
 
 ## 1.1.0 - 2026-10-21
 

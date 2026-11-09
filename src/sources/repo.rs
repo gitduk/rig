@@ -3,18 +3,18 @@
 use std::fs;
 use std::path::Path;
 
-use anyhow::{Context, anyhow, bail};
+use anyhow::{Context, anyhow};
 use time::OffsetDateTime;
 
 use crate::config::{self, RepoEntry};
 use crate::lock::{Lock, ToolLock};
-use crate::output::progress;
+use crate::output::{progress, warning};
 use crate::paths::Layout;
 use crate::version::github::{self, Asset};
 
 use super::{
-    AssetPick, Phase, collect_artifacts, download, extract, finalize_partial, run_setup,
-    select_asset, tool_key,
+    AssetPick, Phase, collect_artifacts, download, extract, finalize_partial, glob_match,
+    pick_ambiguous, run_setup, select_asset, tool_key,
 };
 
 /// Runs the full install flow; regenerating init.zsh is the caller's job.
@@ -58,11 +58,9 @@ pub fn install(
             return Err(anyhow!(body).context(headline));
         }
         AssetPick::Ambiguous(matches) => {
-            let list: String = matches
-                .iter()
-                .map(|a| format!("\n    - {}", a.name))
-                .collect();
-            bail!("bpick matches multiple assets, narrow it:{list}");
+            let asset = pick_ambiguous(tool, &matches, entry.bpick.is_some())?;
+            suggest_narrowed_bpick(tool, &release.assets, asset, entry, layout, &release.tag);
+            asset
         }
     };
 
@@ -186,9 +184,57 @@ fn no_match_body(
     format!("no asset matches your platform{suffix}\navailable assets:{list}")
 }
 
+/// Shows the `bpick` that would make this pick automatic next release;
+/// says so instead when no glob can express the difference (a version
+/// prefix is not a negative match).
+fn suggest_narrowed_bpick(
+    tool: &str,
+    assets: &[Asset],
+    asset: &Asset,
+    entry: &RepoEntry,
+    layout: &Layout,
+    tag: &str,
+) {
+    let Some(suggested) = suggest_bpick(std::slice::from_ref(&asset), tag) else {
+        return;
+    };
+    if !narrows_to(&suggested, assets, asset) {
+        warning!(
+            "{tool}: no `bpick` can single out {} in this release — you'll be asked again next release",
+            asset.name
+        );
+        return;
+    }
+
+    let current = entry
+        .bpick
+        .as_ref()
+        .map(config::BpickSpec::patterns)
+        .unwrap_or_default();
+    if current.contains(&suggested.as_str()) {
+        return;
+    }
+    if let Some(diff) =
+        config::render_entry_diff(&layout.config_path, &entry.name, "bpick", Some(&suggested))
+    {
+        warning!(
+            "{tool}: picked {} — set `bpick` to skip this prompt next time\n{diff}",
+            asset.name
+        );
+    }
+}
+
+/// True when `pattern` selects `asset` and nothing else in the release.
+fn narrows_to(pattern: &str, assets: &[Asset], asset: &Asset) -> bool {
+    let mut matched = assets.iter().filter(|a| glob_match(pattern, &a.name));
+    matches!((matched.next(), matched.next()), (Some(only), None) if only.name == asset.name)
+}
+
 /// `foo-15.2.0-linux.tar.gz` -> `foo-*-linux.tar.gz`, so the fix survives
 /// future releases instead of pinning this exact version.
 fn suggest_bpick(relevant: &[&Asset], version: &str) -> Option<String> {
+    // Tags are often `v`-prefixed while asset names carry the bare version.
+    let version = version.strip_prefix('v').unwrap_or(version);
     let extractable = |name: &str| {
         name.ends_with(".tar.gz")
             || name.ends_with(".tgz")
@@ -259,6 +305,64 @@ mod tests {
                 ..config::test_common()
             },
         }
+    }
+
+    fn test_asset(name: &str) -> Asset {
+        Asset {
+            name: name.to_string(),
+            url: String::new(),
+            size: 0,
+            digest: None,
+        }
+    }
+
+    #[test]
+    fn suggest_bpick_strips_a_v_prefixed_tag() {
+        let assets = [test_asset("DBX_0.6.68_amd64.deb")];
+        let refs: Vec<&Asset> = assets.iter().collect();
+
+        assert_eq!(
+            suggest_bpick(&refs, "v0.6.68").as_deref(),
+            Some("DBX_*_amd64.deb")
+        );
+        assert_eq!(suggest_bpick(&refs, "v0.6.69"), None);
+    }
+
+    #[test]
+    fn no_match_body_suggests_a_pattern_for_a_v_prefixed_tag() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let layout = Layout::new(tmp.path(), "~/.local");
+        fs::write(&layout.config_path, "[[repo]]\nname = \"t8y2/dbx\"\n").expect("write config");
+        let entry = RepoEntry {
+            name: "t8y2/dbx".to_string(),
+            host: Host::Github,
+            bpick: None,
+            extract: None,
+            common: Common {
+                ..config::test_common()
+            },
+        };
+        let assets = [test_asset("DBX_0.6.68_amd64.deb")];
+        let relevant: Vec<&Asset> = assets.iter().collect();
+
+        let body = no_match_body(&entry, &layout, "v0.6.68", false, &relevant, &assets);
+
+        assert!(
+            body.contains("+ bpick = \"DBX_*_amd64.deb\""),
+            "unexpected body:\n{body}"
+        );
+    }
+
+    #[test]
+    fn narrows_to_rejects_a_pattern_that_still_matches_a_sibling() {
+        let assets = [
+            test_asset("DBX_0.6.68_amd64.deb"),
+            test_asset("DBX_0.6.68-beta.20261107.4_amd64.deb"),
+        ];
+        let stable = &assets[0];
+
+        assert!(!narrows_to("DBX_*_amd64.deb", &assets, stable));
+        assert!(narrows_to("DBX_0.6.68_amd64.deb", &assets, stable));
     }
 
     #[test]
