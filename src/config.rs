@@ -212,12 +212,34 @@ pub enum BpickSpec {
 }
 
 impl BpickSpec {
-    /// The globs to try, in order — the one expansion every caller uses.
+    /// The globs as written, `!` prefixes intact — the one expansion every
+    /// caller uses; `filters()` is the selecting view of them.
     pub fn patterns(&self) -> Vec<&str> {
         match self {
             Self::Single(pattern) => vec![pattern.as_str()],
             Self::Multiple(patterns) => patterns.iter().map(String::as_str).collect(),
         }
+    }
+
+    /// `(must-all-match, must-miss)` — every plain glob must match and every
+    /// `!`-prefixed one must miss, so a list narrows instead of unioning.
+    pub fn filters(&self) -> (Vec<&str>, Vec<&str>) {
+        let mut require = Vec::new();
+        let mut forbid = Vec::new();
+        for pattern in self.patterns() {
+            match pattern.strip_prefix('!') {
+                Some(excluded) => forbid.push(excluded),
+                None => require.push(pattern),
+            }
+        }
+        (require, forbid)
+    }
+}
+
+#[cfg(test)]
+impl BpickSpec {
+    pub(crate) fn list(patterns: &[&str]) -> Self {
+        Self::Multiple(patterns.iter().map(|p| (*p).to_string()).collect())
     }
 }
 
@@ -414,6 +436,7 @@ pub fn parse(input: &str) -> anyhow::Result<Config> {
     let config: Config =
         toml::from_str(input).with_context(|| format!("failed to parse {CONFIG_PATH_HINT}"))?;
     check_unique_keys(&config)?;
+    check_bpick_globs(&config)?;
     Ok(config)
 }
 
@@ -438,6 +461,23 @@ fn check_unique_keys(config: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A `bpick` with nothing but `!` globs would select every asset the
+/// exclusions leave — other platforms included.
+fn check_bpick_globs(config: &Config) -> anyhow::Result<()> {
+    for entry in &config.repo {
+        let Some(spec) = &entry.bpick else { continue };
+        if spec.filters().0.is_empty() {
+            bail!(
+                "[[repo]] {} has a `bpick` with no plain glob — it would select whatever \
+                 the `!` exclusions leave, other platforms included; add the glob the \
+                 asset must match, e.g. `bpick = [\"foo-*.tar.gz\", \"!*arm64*\"]`",
+                entry.name
+            );
+        }
+    }
+    Ok(())
+}
+
 pub fn load(path: &Path) -> anyhow::Result<Config> {
     let text =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
@@ -445,13 +485,13 @@ pub fn load(path: &Path) -> anyhow::Result<Config> {
 }
 
 /// `toml::from_str` discards source spans, so this re-reads as text and
-/// marks `key`'s line git-diff style: `-` old value, `+` `replacement`.
-pub fn render_entry_diff(
+/// marks the entry's `bpick` line git-diff style: `-` old value, `+` `replacement`.
+pub fn render_bpick_diff(
     config_path: &Path,
     name: &str,
-    key: &str,
-    replacement: Option<&str>,
+    replacement: Option<&BpickSpec>,
 ) -> Option<String> {
+    let replacement = replacement.map(render_bpick_value);
     let text = fs::read_to_string(config_path).ok()?;
     let lines: Vec<&str> = text.lines().collect();
     let name_line = format!("name = \"{name}\"");
@@ -470,27 +510,38 @@ pub fn render_entry_diff(
         .map(|l| l.trim())
         .filter(|l| !l.is_empty())
         .collect();
-    let key_prefix = format!("{key} =");
-    let key_exists = block.iter().any(|l| l.starts_with(&key_prefix));
+    let key_prefix = "bpick =";
+    let key_exists = block.iter().any(|l| l.starts_with(key_prefix));
 
     let mut out = Vec::new();
     for &line in &block {
-        if line.starts_with(&key_prefix) {
+        if line.starts_with(key_prefix) {
             out.push(format!("- {line}"));
-            if let Some(value) = replacement {
-                out.push(format!("+ {key} = \"{value}\""));
+            if let Some(value) = &replacement {
+                out.push(format!("+ bpick = {value}"));
             }
         } else {
             out.push(format!("| {line}"));
             if !key_exists
                 && line == name_line
-                && let Some(value) = replacement
+                && let Some(value) = &replacement
             {
-                out.push(format!("+ {key} = \"{value}\""));
+                out.push(format!("+ bpick = {value}"));
             }
         }
     }
     Some(out.join("\n"))
+}
+
+/// TOML as the config would spell it: one quoted string, or an array.
+fn render_bpick_value(spec: &BpickSpec) -> String {
+    match spec {
+        BpickSpec::Single(pattern) => format!("\"{pattern}\""),
+        BpickSpec::Multiple(patterns) => {
+            let quoted: Vec<String> = patterns.iter().map(|p| format!("\"{p}\"")).collect();
+            format!("[{}]", quoted.join(", "))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -554,6 +605,45 @@ run = "_zsh_autosuggest_start"
             cfg.plugin[0].source.as_deref(),
             Some("zsh-autosuggestions.zsh")
         );
+    }
+
+    #[test]
+    fn parse_rejects_a_bpick_with_no_plain_glob() {
+        for bpick in [r#"["!*arm64*"]"#, "[]", r#""!*arm64*""#] {
+            let err = parse(&format!("[[repo]]\nname = \"o/o\"\nbpick = {bpick}\n"))
+                .expect_err("an exclusion-only bpick must be rejected");
+            assert!(
+                err.to_string().contains("no plain glob"),
+                "unexpected error for {bpick}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn render_bpick_diff_spells_a_list_as_an_array() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("rig.toml");
+        fs::write(&path, "[[repo]]\nname = \"o/o\"\nbpick = \"old\"\n").expect("write");
+
+        let diff = render_bpick_diff(
+            &path,
+            "o/o",
+            Some(&BpickSpec::list(&["a-*.zip", "!*arm64*"])),
+        )
+        .expect("diff");
+
+        assert!(
+            diff.contains("+ bpick = [\"a-*.zip\", \"!*arm64*\"]"),
+            "unexpected diff:\n{diff}"
+        );
+    }
+
+    #[test]
+    fn bpick_filters_split_exclusions_from_required_globs() {
+        let spec = BpickSpec::list(&["Obsidian-*.AppImage", "!*arm64*"]);
+        let (require, forbid) = spec.filters();
+        assert_eq!(require, ["Obsidian-*.AppImage"]);
+        assert_eq!(forbid, ["*arm64*"]);
     }
 
     #[test]

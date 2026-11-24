@@ -166,7 +166,7 @@ fn print_error(prefix: Option<&str>, err: &anyhow::Error) {
     }
     for cause in chain {
         for line in cause.to_string().lines() {
-            // `- `/`+ `/`| ` come from config.rs::render_entry_diff — old
+            // `- `/`+ `/`| ` come from config.rs::render_bpick_diff — old
             // value, suggested value, reproduced context; else stays dim.
             if let Some(rest) = line.strip_prefix("- ") {
                 eprintln!("{bold_red}  - {rest}{reset}");

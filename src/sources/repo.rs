@@ -6,14 +6,14 @@ use std::path::Path;
 use anyhow::{Context, anyhow};
 use time::OffsetDateTime;
 
-use crate::config::{self, RepoEntry};
+use crate::config::{self, BpickSpec, RepoEntry};
 use crate::lock::{Lock, ToolLock};
 use crate::output::{progress, warning};
 use crate::paths::Layout;
 use crate::version::github::{self, Asset};
 
 use super::{
-    AssetPick, Phase, collect_artifacts, download, extract, finalize_partial, glob_match,
+    AssetPick, Phase, bpick_selects, collect_artifacts, download, extract, finalize_partial,
     pick_ambiguous, run_setup, select_asset, tool_key,
 };
 
@@ -161,8 +161,11 @@ fn no_match_body(
     all: &[Asset],
 ) -> String {
     if let Some(value) = suggest_bpick(relevant, version)
-        && let Some(diff) =
-            config::render_entry_diff(&layout.config_path, &entry.name, "bpick", Some(&value))
+        && let Some(diff) = config::render_bpick_diff(
+            &layout.config_path,
+            &entry.name,
+            Some(&BpickSpec::Single(value)),
+        )
     {
         return format!("{}\n{diff}", layout.config_path.display());
     }
@@ -185,8 +188,7 @@ fn no_match_body(
 }
 
 /// Shows the `bpick` that would make this pick automatic next release;
-/// says so instead when no glob can express the difference (a version
-/// prefix is not a negative match).
+/// says so instead when even a glob plus exclusions cannot express it.
 fn suggest_narrowed_bpick(
     tool: &str,
     assets: &[Asset],
@@ -195,27 +197,24 @@ fn suggest_narrowed_bpick(
     layout: &Layout,
     tag: &str,
 ) {
-    let Some(suggested) = suggest_bpick(std::slice::from_ref(&asset), tag) else {
-        return;
-    };
-    if !narrows_to(&suggested, assets, asset) {
+    let Some(suggested) = suggest_narrowing(assets, asset, tag) else {
         warning!(
             "{tool}: no `bpick` can single out {} in this release — you'll be asked again next release",
             asset.name
         );
         return;
-    }
+    };
 
     let current = entry
         .bpick
         .as_ref()
         .map(config::BpickSpec::patterns)
         .unwrap_or_default();
-    if current.contains(&suggested.as_str()) {
+    if current == suggested.patterns() {
         return;
     }
     if let Some(diff) =
-        config::render_entry_diff(&layout.config_path, &entry.name, "bpick", Some(&suggested))
+        config::render_bpick_diff(&layout.config_path, &entry.name, Some(&suggested))
     {
         warning!(
             "{tool}: picked {} — set `bpick` to skip this prompt next time\n{diff}",
@@ -224,9 +223,43 @@ fn suggest_narrowed_bpick(
     }
 }
 
-/// True when `pattern` selects `asset` and nothing else in the release.
-fn narrows_to(pattern: &str, assets: &[Asset], asset: &Asset) -> bool {
-    let mut matched = assets.iter().filter(|a| glob_match(pattern, &a.name));
+/// Settles `asset` next release: the plain glob when it already singles the
+/// asset out, else that glob plus one `!` exclusion per sibling it catches.
+fn suggest_narrowing(assets: &[Asset], asset: &Asset, tag: &str) -> Option<BpickSpec> {
+    let glob = suggest_bpick(std::slice::from_ref(&asset), tag)?;
+    let plain = BpickSpec::Single(glob.clone());
+    if narrows_to(&plain, assets, asset) {
+        return Some(plain);
+    }
+
+    let (require, forbid) = plain.filters();
+    let mut patterns = vec![glob];
+    for sibling in assets
+        .iter()
+        .filter(|a| a.name != asset.name && bpick_selects(&require, &forbid, &a.name))
+    {
+        patterns.push(format!("!{}", exclusion_for(asset, sibling)?));
+    }
+    let narrowed = BpickSpec::Multiple(patterns);
+    narrows_to(&narrowed, assets, asset).then_some(narrowed)
+}
+
+/// A glob that matches `sibling` and not `asset`: the sibling's first word
+/// absent from `asset`'s name, which survives future versions.
+fn exclusion_for(asset: &Asset, sibling: &Asset) -> Option<String> {
+    sibling
+        .name
+        .split(|c: char| !c.is_alphanumeric())
+        .find(|word| word.len() > 2 && !asset.name.contains(word))
+        .map(|word| format!("*{word}*"))
+}
+
+/// True when `spec` selects `asset` and nothing else in the release.
+fn narrows_to(spec: &BpickSpec, assets: &[Asset], asset: &Asset) -> bool {
+    let (require, forbid) = spec.filters();
+    let mut matched = assets
+        .iter()
+        .filter(|a| bpick_selects(&require, &forbid, &a.name));
     matches!((matched.next(), matched.next()), (Some(only), None) if only.name == asset.name)
 }
 
@@ -361,8 +394,40 @@ mod tests {
         ];
         let stable = &assets[0];
 
-        assert!(!narrows_to("DBX_*_amd64.deb", &assets, stable));
-        assert!(narrows_to("DBX_0.6.68_amd64.deb", &assets, stable));
+        assert!(!narrows_to(
+            &BpickSpec::Single("DBX_*_amd64.deb".to_string()),
+            &assets,
+            stable
+        ));
+        assert!(narrows_to(
+            &BpickSpec::Single("DBX_0.6.68_amd64.deb".to_string()),
+            &assets,
+            stable
+        ));
+        assert!(narrows_to(
+            &BpickSpec::list(&["DBX_*_amd64.deb", "!*beta*"]),
+            &assets,
+            stable
+        ));
+    }
+
+    #[test]
+    fn suggest_narrowing_excludes_a_sibling_a_plain_glob_catches() {
+        let assets = [
+            test_asset("DBX_0.6.68_amd64.deb"),
+            test_asset("DBX_0.6.68-beta.20261107.4_amd64.deb"),
+        ];
+
+        let suggested = suggest_narrowing(&assets, &assets[0], "v0.6.68")
+            .expect("a glob plus an exclusion settles it");
+        assert_eq!(suggested.patterns(), ["DBX_*_amd64.deb", "!*beta*"]);
+    }
+
+    #[test]
+    fn suggest_narrowing_gives_up_when_a_sibling_shares_every_word() {
+        let assets = [test_asset("tool-1.0.zip"), test_asset("tool-2.0.zip")];
+
+        assert!(suggest_narrowing(&assets, &assets[0], "v1.0").is_none());
     }
 
     #[test]

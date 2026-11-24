@@ -139,6 +139,12 @@ pub enum AssetPick<'a> {
     Ambiguous(Vec<&'a Asset>),
 }
 
+/// Every `require` glob must match and no `forbid` glob may — the one
+/// predicate behind `bpick`, shared with the asset suggester.
+pub fn bpick_selects(require: &[&str], forbid: &[&str], name: &str) -> bool {
+    require.iter().all(|p| glob_match(p, name)) && !forbid.iter().any(|p| glob_match(p, name))
+}
+
 /// Explicit `bpick` wins; else a naive `<arch>-<os>` filter.
 pub fn select_asset<'a>(assets: &'a [Asset], bpick: Option<&BpickSpec>) -> AssetPick<'a> {
     let arch = host_arch();
@@ -147,10 +153,10 @@ pub fn select_asset<'a>(assets: &'a [Asset], bpick: Option<&BpickSpec>) -> Asset
 
     let (matches, bpick_configured) = match bpick {
         Some(spec) => {
-            let patterns = spec.patterns();
+            let (require, forbid) = spec.filters();
             let matches: Vec<&Asset> = assets
                 .iter()
-                .filter(|a| patterns.iter().any(|p| glob_match(p, &a.name)))
+                .filter(|a| bpick_selects(&require, &forbid, &a.name))
                 .collect();
             (matches, true)
         }
@@ -1392,6 +1398,49 @@ mod tests {
             panic!("bpick should match exactly one asset");
         };
         assert!(picked.name.contains("musl"));
+    }
+
+    #[test]
+    fn bpick_list_narrows_by_every_glob() {
+        let assets = vec![
+            asset("Obsidian-1.15.1.AppImage"),
+            asset("Obsidian-1.15.1-arm64.AppImage"),
+            asset("obsidian-1.15.1-arm64.tar.gz"),
+        ];
+        let bpick = BpickSpec::list(&["Obsidian-*.AppImage", "*arm64*"]);
+        let AssetPick::Found(picked) = select_asset(&assets, Some(&bpick)) else {
+            panic!("both globs single out the arm64 AppImage");
+        };
+        assert_eq!(picked.name, "Obsidian-1.15.1-arm64.AppImage");
+    }
+
+    #[test]
+    fn bpick_negation_drops_the_excluded_asset() {
+        let assets = vec![
+            asset("Obsidian-1.15.1.AppImage"),
+            asset("Obsidian-1.15.1-arm64.AppImage"),
+        ];
+        let bpick = BpickSpec::list(&["Obsidian-*.AppImage", "!*arm64*"]);
+        let AssetPick::Found(picked) = select_asset(&assets, Some(&bpick)) else {
+            panic!("the exclusion should leave one asset");
+        };
+        assert_eq!(picked.name, "Obsidian-1.15.1.AppImage");
+    }
+
+    #[test]
+    fn bpick_forbidding_every_required_match_reports_no_match() {
+        let assets = vec![
+            asset("Obsidian-1.15.1.AppImage"),
+            asset("Obsidian-1.15.1-arm64.AppImage"),
+        ];
+        let bpick = BpickSpec::list(&["Obsidian-*.AppImage", "!*AppImage"]);
+        let AssetPick::NoMatch {
+            bpick_configured, ..
+        } = select_asset(&assets, Some(&bpick))
+        else {
+            panic!("an exclusion covering every required match leaves nothing");
+        };
+        assert!(bpick_configured);
     }
 
     #[test]

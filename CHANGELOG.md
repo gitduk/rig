@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Breaking
+
+- A `bpick` list is a filter, not a union: every plain glob must match the
+  asset name and every `!`-prefixed glob must not, so
+  `bpick = ["Obsidian-*.AppImage", "!*arm64*"]` narrows to the host build
+  while `bpick = ["foo-*.zip", "bar-*.zip"]` now matches nothing and fails
+  with "no release asset matches bpick", and a `bpick` with no plain glob
+  is rejected when the config loads.
+
 ### Changed
 
 - An ambiguous release asset is a question instead of a failure: when `bpick`

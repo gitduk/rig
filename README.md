@@ -107,13 +107,21 @@ run = "_zsh_autosuggest_start"
 
 | Source | What rig does | Version source |
 | --- | --- | --- |
-| `[[repo]]` | Picks a release asset (explicit `bpick` glob or host-arch/os auto-match), downloads, extracts (a lone top-level dir is unwrapped), symlinks bins | GitHub/Codeberg release |
+| `[[repo]]` | Picks a release asset (explicit `bpick` glob(s) or host-arch/os auto-match), downloads, extracts (a lone top-level dir is unwrapped), symlinks bins | GitHub/Codeberg release |
 | `[[git]]` | Clones, runs `setup` (build), symlinks bins | git HEAD |
 | `[[cargo]]` | `cargo install` | crates.io |
 | `[[node]]` | `bun add -g` / `npm i -g` (`manager = auto` probes bun first) | npm registry |
 | `[[apt]]` | `apt-get install`; rig records the dpkg-reported version and where the bin landed | no pre-check — `rig update` reruns `apt-get install`, reports up to date when the version didn't change |
 | `[[curl]]` | Fetches `url` and runs it as a script | none — skipped by blanket `rig update`; reruns only when named explicitly (`rig update <tool>`) |
 | `[[plugin]]` | Clones to `~/.local/share/rig/plugins/`; zsh `source`s `source` and runs `run` right after | git pull |
+
+`bpick` takes one glob or a list, and a list is a filter: every plain glob
+must match the asset name and every `!`-prefixed glob must miss. That is how
+a release naming both architectures after one pattern is narrowed to the
+host build — `bpick = ["Obsidian-*.AppImage", "!*arm64*"]`. A `bpick` needs
+at least one plain glob (`["!*arm64*"]` is rejected at load: it would pick
+whatever the exclusions leave, other platforms included), and an asset name
+that itself starts with `!` cannot be targeted.
 
 ### Shared fields
 
