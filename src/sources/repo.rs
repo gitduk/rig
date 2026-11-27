@@ -17,17 +17,23 @@ use super::{
     pick_ambiguous, run_setup, select_asset, tool_key,
 };
 
-/// Runs the full install flow; regenerating init.zsh is the caller's job.
-/// Returns the new lock entry — the caller inserts it and saves `rig.lock`.
+/// Resolves the release `install` takes, with the context every caller wants.
+pub fn resolve(entry: &RepoEntry) -> anyhow::Result<github::Release> {
+    github::latest_release(&entry.name, entry.host)
+        .with_context(|| format!("failed to resolve latest release for {}", entry.name))
+}
+
+/// Installs the release the caller resolved; regenerating init.zsh is the
+/// caller's job. Returns the new lock entry — the caller inserts it and saves
+/// `rig.lock`.
 pub fn install(
     entry: &RepoEntry,
     layout: &Layout,
     lock: &Lock,
     phase: Phase,
+    release: &github::Release,
 ) -> anyhow::Result<ToolLock> {
     let tool = tool_key(&entry.name);
-    let release = github::latest_release(&entry.name, entry.host)
-        .with_context(|| format!("failed to resolve latest release for {}", entry.name))?;
     progress!(
         "{tool}: {} via {} release ({})",
         phase.describe_doing(&release.tag),
@@ -116,7 +122,7 @@ pub fn install(
         super::resolve_eval_cache(tool, entry.common.eval.as_ref());
 
     Ok(ToolLock {
-        version: release.tag,
+        version: release.tag.clone(),
         source: format!("{}:{}", entry.host.prefix(), entry.name),
         installed_at: OffsetDateTime::now_utc(),
         bins: artifacts
@@ -439,9 +445,10 @@ mod tests {
         let layout = Layout::new(&home, "~/.local");
         let entry = delta_entry();
 
+        let release = resolve(&entry).expect("resolve delta release");
         let lock = Lock::default();
-        let tool_lock =
-            install(&entry, &layout, &lock, Phase::Install).expect("delta should install cleanly");
+        let tool_lock = install(&entry, &layout, &lock, Phase::Install, &release)
+            .expect("delta should install cleanly");
 
         assert_eq!(tool_lock.bins.len(), 1);
         let bin_path = PathBuf::from(&tool_lock.bins[0]);
@@ -451,7 +458,7 @@ mod tests {
         // Reinstalling the same tool must not trip the untracked-conflict check.
         let mut lock2 = Lock::default();
         lock2.tool.insert("delta".to_string(), tool_lock);
-        install(&entry, &layout, &lock2, Phase::Install)
+        install(&entry, &layout, &lock2, Phase::Install, &release)
             .expect("reinstall over our own tracked bins should succeed");
     }
 }

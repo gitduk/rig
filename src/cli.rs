@@ -414,7 +414,10 @@ fn install_one(
     }
 
     let new_lock = match resolved {
-        ResolvedEntry::Repo(e) => sources::repo::install(e, layout, lock, sources::Phase::Install)?,
+        ResolvedEntry::Repo(e) => {
+            let release = sources::repo::resolve(e)?;
+            sources::repo::install(e, layout, lock, sources::Phase::Install, &release)?
+        }
         ResolvedEntry::Git(e) => sources::git::install(e, layout, lock, sources::Phase::Install)?,
         ResolvedEntry::Cargo(e) => {
             sources::cargo::install(e, layout, lock, sources::Phase::Install)?

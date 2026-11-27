@@ -18,6 +18,8 @@
   them and reads a number from the terminal (a non-TTY run still refuses with
   the same list). After the pick rig prints the `bpick` that would settle the
   choice next release, or says plainly that no glob can.
+- `rig update` resolves a repo's release once per run: the pre-check hands the
+  release it compared to the install step instead of querying the API twice.
 - Parallel `rig update` on a terminal prints each tool's result above the
   live counter as it lands, like `rig install`; failures get a one-line
   notice there and their details at the end. The summary no longer repeats
@@ -34,6 +36,10 @@
 
 ### Fixed
 
+- A repo whose every release is marked prerelease installs again: GitHub and
+  Codeberg answer `/releases/latest` with 404 in that case, so the version
+  lookup falls back to the newest non-draft entry of `/releases`, keeping a
+  project that only publishes prereleases reachable without pinning a tag.
 - `bpick` suggestions now fire for `v`-prefixed tags: `v0.6.68` was compared
   verbatim against names like `DBX_0.6.68_amd64.deb`, so a failed asset pick
   fell back to the raw list instead of proposing a pattern.

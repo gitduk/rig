@@ -14,6 +14,7 @@ use crate::paths::{CONFIG_PATH_HINT, Layout};
 use crate::pool;
 use crate::sources;
 use crate::version;
+use crate::version::github::Release;
 
 /// What `update_all` does with each tool.
 #[derive(Clone, Copy)]
@@ -242,7 +243,7 @@ fn update_one(
     let key = entry.key();
     let force = match mode {
         Mode::RefreshEval => return refresh_eval_cache(&entry, &key, lock),
-        Mode::Check => return Ok((check(&entry, &key, lock, layout)?, None)),
+        Mode::Check => return Ok((check(&entry, &key, lock, layout)?.0, None)),
         Mode::Update { force } => force,
     };
     // Plugin's `git pull` is its own check — a prior ls-remote would double
@@ -252,14 +253,16 @@ fn update_one(
         ResolvedEntry::Apt(_) => true,
         _ => !force,
     };
+    let mut checked = None;
     if pre_check {
-        let outcome = check(&entry, &key, lock, layout)?;
+        let (outcome, release) = check(&entry, &key, lock, layout)?;
         if matches!(outcome, Outcome::UpToDate { .. }) {
             return Ok((outcome, None));
         }
+        checked = release;
     }
     match entry {
-        ResolvedEntry::Repo(e) => update_repo(e, &key, lock, layout),
+        ResolvedEntry::Repo(e) => update_repo(e, &key, lock, layout, checked),
         ResolvedEntry::Git(e) => update_git(e, &key, lock, layout),
         ResolvedEntry::Cargo(e) => update_cargo(e, &key, lock, layout),
         ResolvedEntry::Node(e) => update_node(e, &key, lock, layout),
@@ -271,18 +274,26 @@ fn update_one(
 
 /// The version query every pre-checked update gates on, and all that
 /// `rig update --check` runs: read-only, no sudo, no clone, no lock change.
+/// A `[[repo]]` hands its resolved release back, so the update that follows
+/// installs exactly the tag this compared.
 fn check(
     entry: &ResolvedEntry,
     key: &str,
     lock: &Lock,
     layout: &Layout,
-) -> anyhow::Result<Outcome> {
+) -> anyhow::Result<(Outcome, Option<Release>)> {
     let current = match entry {
         ResolvedEntry::Plugin(_) => plugin_version(key, lock, layout)?,
         _ => already_installed(lock, key)?,
     };
+    let mut release = None;
     let latest = match entry {
-        ResolvedEntry::Repo(e) => Some(version::github::latest_release(&e.name, e.host)?.tag),
+        ResolvedEntry::Repo(e) => {
+            let resolved = version::github::latest_release(&e.name, e.host)?;
+            let tag = resolved.tag.clone();
+            release = Some(resolved);
+            Some(tag)
+        }
         ResolvedEntry::Git(e) => Some(sources::git::remote_head_commit(e.host, &e.name)?),
         ResolvedEntry::Cargo(e) => Some(version::crates_io::latest_version(&e.name)?),
         ResolvedEntry::Node(e) => Some(version::npm::latest(&e.name)?.version),
@@ -290,11 +301,12 @@ fn check(
         ResolvedEntry::Curl(_) => None,
         ResolvedEntry::Plugin(e) => Some(sources::plugin::remote_head_commit(e)?),
     };
-    Ok(match latest {
+    let outcome = match latest {
         Some(to) if to == current => Outcome::UpToDate { version: current },
         Some(to) => Outcome::Outdated { from: current, to },
         None => Outcome::Unknown,
-    })
+    };
+    Ok((outcome, release))
 }
 
 /// Folds an update check into `rig install` for an already-installed tool:
@@ -356,8 +368,14 @@ fn update_repo(
     key: &str,
     lock: &Lock,
     layout: &Layout,
+    checked: Option<Release>,
 ) -> anyhow::Result<(Outcome, Option<LockChange>)> {
     let current_version = already_installed(lock, key)?;
+    // A forced update skips the pre-check, so it resolves here instead.
+    let release = match checked {
+        Some(release) => release,
+        None => sources::repo::resolve(entry)?,
+    };
 
     let new_lock = sources::repo::install(
         entry,
@@ -366,6 +384,7 @@ fn update_repo(
         sources::Phase::Update {
             from: &current_version,
         },
+        &release,
     )?;
     let to = new_lock.version.clone();
     Ok((
@@ -740,7 +759,7 @@ mod tests {
         let layout = Layout::new(tmp.path(), "~/.local");
         let entry = delta_entry();
 
-        let outcome = update_repo(&entry, "delta", &lock, &layout);
+        let outcome = update_repo(&entry, "delta", &lock, &layout, None);
         assert!(outcome.is_err());
         assert!(outcome.unwrap_err().to_string().contains("not installed"));
 
@@ -815,8 +834,10 @@ mod tests {
         let entry = delta_entry();
 
         let mut lock = Lock::default();
-        let installed = sources::repo::install(&entry, &layout, &lock, sources::Phase::Install)
-            .expect("initial install");
+        let release = sources::repo::resolve(&entry).expect("resolve delta release");
+        let installed =
+            sources::repo::install(&entry, &layout, &lock, sources::Phase::Install, &release)
+                .expect("initial install");
         lock.tool.insert("delta".to_string(), installed);
         let mut config = Config::default();
         config.repo.push(entry);
